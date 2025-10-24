@@ -80,12 +80,22 @@ def get_presign(
     key = f"{settings.S3_INPUT_PREFIX}{safe}"
     return presign_upload(key, content_type)
 
+@app.get("/api/presign_view")
+def get_presign_view(
+    key: str = Query(..., description="S3 object key to view/stream"),
+    _: None = Depends(single_user_guard),
+):
+    # Stream/play in browser
+    return {"url": presign_download(key, as_attachment=False)}
+
 @app.get("/api/presign_download")
 def get_presign_download(
     key: str = Query(..., description="S3 object key to download"),
     _: None = Depends(single_user_guard),
 ):
-    return {"url": presign_download(key)}
+    # Force download via Content-Disposition: attachment
+    name = key.split("/")[-1] or "download"
+    return {"url": presign_download(key, as_attachment=True, download_name=name)}
 
 @app.post("/api/presign_download_many")
 def presign_download_many(
@@ -93,7 +103,11 @@ def presign_download_many(
     _: None = Depends(single_user_guard),
 ):
     keys: List[str] = payload.get("keys", [])
-    return {"links": [{"key": k, "url": presign_download(k)} for k in keys]}
+    links = []
+    for k in keys:
+        name = k.split("/")[-1] or "download"
+        links.append({"key": k, "url": presign_download(k, as_attachment=True, download_name=name)})
+    return {"links": links}
 
 @app.get("/api/list_objects")
 def api_list_objects(
