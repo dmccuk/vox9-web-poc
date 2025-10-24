@@ -112,6 +112,13 @@
       return body;
     }
 
+    async function presignView(key) {
+      const url = `${apiBase}/api/presign_view?key=${encodeURIComponent(key)}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('view presign failed');
+      return res.json(); // { url }
+    }
+
     async function presignDownload(key) {
       const url = `${apiBase}/api/presign_download?key=${encodeURIComponent(key)}`;
       const res = await fetch(url);
@@ -135,7 +142,7 @@
         copyLinksBtn.disabled = true;
         return;
       }
-      const rows = items.map((it, idx) => {
+      const rows = items.map((it) => {
         const name = it.key.split('/').pop();
         return `
           <tr data-key="${it.key}">
@@ -143,7 +150,9 @@
             <td><code title="${it.key}">${name}</code></td>
             <td class="right">${(it.size/1024/1024).toFixed(2)} MB</td>
             <td>${new Date(it.last_modified).toLocaleString()}</td>
-            <td><button class="viewBtn" data-key="${it.key}">View</button></td>
+            <td>
+              <button class="viewBtn" data-key="${it.key}">View</button>
+            </td>
           </tr>
         `;
       }).join('');
@@ -168,12 +177,12 @@
       selBoxes.forEach(b => b.addEventListener('change', updateBulkButtons));
       updateBulkButtons();
 
-      // wire per-row view buttons
+      // wire per-row "View" (stream) buttons
       fileTableWrap.querySelectorAll('.viewBtn').forEach(btn => {
         btn.addEventListener('click', async (e) => {
           const key = e.currentTarget.getAttribute('data-key');
-          const dl = await presignDownload(key);
-          window.open(dl.url, '_blank', 'noopener');
+          const v = await presignView(key);
+          window.open(v.url, '_blank', 'noopener'); // stream/play in new tab
         });
       });
     }
@@ -187,9 +196,9 @@
         const ps = await presign(f.name, f.type || 'application/octet-stream');
         await s3Post(ps.url, ps.fields, f);
         uploadedKey = ps.fields.key;
-        const dl = await presignDownload(uploadedKey);
+        const dl = await presignDownload(uploadedKey); // download (attachment)
         upStatus.innerHTML = `Uploaded to S3 ✓ <code>${uploadedKey}</code><br/>
-          <a href="${dl.url}" target="_blank" rel="noopener">Download / View (expires in ~1h)</a>`;
+          <a href="${dl.url}" download target="_blank" rel="noopener">Download (expires ~1h)</a>`;
       } catch (e) {
         console.error(e);
         upStatus.textContent = 'Upload failed';
@@ -235,17 +244,24 @@
     downloadSelectedBtn.addEventListener('click', async () => {
       const keys = [...fileTableWrap.querySelectorAll('.sel:checked')].map(b => b.getAttribute('data-key'));
       if (!keys.length) return;
-      // Request batch presigned links
+      // Request batch presigned links (attachment=true)
       const res = await fetch(`${apiBase}/api/presign_download_many`, {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ keys })
       });
       if (!res.ok) { alert('Failed to get links'); return; }
       const data = await res.json();
-      // Open downloads in sequence (browsers may block too many at once)
       for (const { url } of data.links) {
-        window.open(url, '_blank', 'noopener');
-        await new Promise(r => setTimeout(r, 200));
+        // attachment disposition will trigger download
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = '';
+        a.target = '_blank';
+        a.rel = 'noopener';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        await new Promise(r => setTimeout(r, 200)); // stagger to avoid popup blockers
       }
     });
 
