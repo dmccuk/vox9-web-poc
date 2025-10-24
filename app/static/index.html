@@ -1,0 +1,68 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Vox-9 POC</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 720px; }
+    textarea { width: 100%; height: 8rem; }
+    pre { background: #111; color: #eee; padding: 1rem; border-radius: 8px; overflow:auto; }
+    button { padding: .6rem 1rem; border-radius: 8px; border: 0; background: #4f46e5; color: #fff; }
+    .muted { color: #777; }
+  </style>
+</head>
+<body>
+  <h1>Vox-9 Web POC</h1>
+  <p class="muted">Single user. No accounts. Paste text, hit Generate.</p>
+
+  <label>Input text</label>
+  <textarea id="text" placeholder="Paste your sample script here..."></textarea>
+  <br/><br/>
+  <button id="go">Generate</button>
+
+  <h3>Status</h3>
+  <div id="status" class="muted">Idle</div>
+  <h3>Output</h3>
+  <pre id="out">(none)</pre>
+
+  <script>
+    const apiBase = location.origin; // same host (Render)
+    const statusEl = document.getElementById('status');
+    const outEl = document.getElementById('out');
+    const goBtn = document.getElementById('go');
+    const textEl = document.getElementById('text');
+
+    async function createJob(text) {
+      const res = await fetch(`${apiBase}/api/jobs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // Browser will prompt for HTTP Basic creds automatically on 401
+        body: JSON.stringify({ text })
+      });
+      return res.json();
+    }
+
+    async function poll(jobId) {
+      statusEl.textContent = 'Running...';
+      while (true) {
+        const res = await fetch(`${apiBase}/api/jobs/${jobId}`);
+        const data = await res.json();
+        if (data.error) { statusEl.textContent = 'Error'; outEl.textContent = data.error; break; }
+        if (data.status === 'completed') { statusEl.textContent = 'Done'; outEl.textContent = data.output_text; break; }
+        if (data.status === 'failed') { statusEl.textContent = 'Failed'; outEl.textContent = data.error || 'Unknown error'; break; }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+
+    goBtn.addEventListener('click', async () => {
+      const txt = textEl.value || '';
+      statusEl.textContent = 'Submitting...';
+      outEl.textContent = '(pending)';
+      const job = await createJob(txt);
+      if (!job.job_id) { statusEl.textContent = 'Error creating job'; return; }
+      poll(job.job_id);
+    });
+  </script>
+</body>
+</html>
