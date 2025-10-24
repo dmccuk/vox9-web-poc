@@ -3,7 +3,7 @@ import re
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, Depends, BackgroundTasks, Query, Body
+from fastapi import FastAPI, Depends, BackgroundTasks, Query, Body, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,7 +40,7 @@ def healthz():
 # ----- CORS (POC: permissive; tighten later) -----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # consider restricting to your Render domain later
+    allow_origins=["*"],  # later: set to your exact Render origin
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -75,6 +75,7 @@ def get_presign(
     content_type: str = Query("application/octet-stream"),
     _: None = Depends(single_user_guard),
 ):
+    # Sanitize filename to avoid policy mismatches
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename)
     key = f"{settings.S3_INPUT_PREFIX}{safe}"
     return presign_upload(key, content_type)
@@ -101,8 +102,12 @@ def api_list_objects(
     max_keys: int = Query(100, ge=1, le=1000),
     _: None = Depends(single_user_guard),
 ):
-    items, next_token = list_objects(prefix=prefix, continuation_token=token, max_keys=max_keys)
-    return {"items": items, "next_token": next_token}
+    try:
+        items, next_token = list_objects(prefix=prefix, continuation_token=token, max_keys=max_keys)
+        return {"items": items, "next_token": next_token}
+    except Exception as e:
+        # Return readable error so the browser shows it instead of a 500
+        raise HTTPException(status_code=400, detail=str(e))
 
 # ----- Job API -----
 @app.post("/api/jobs")
@@ -112,7 +117,7 @@ def create_job(payload: Dict, bg: BackgroundTasks, _: None = Depends(single_user
     { "text": "hello world", "s3_input_key": "inputs/foo.mp4" }
     """
     text = (payload or {}).get("text") or ""
-    # s3_key = (payload or {}).get("s3_input_key")  # for future real processing
+    # s3_key = (payload or {}).get("s3_input_key")  # wire to your real pipeline later
 
     job = save_job(Job(input_text=text, status="queued"))
 
