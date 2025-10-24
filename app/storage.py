@@ -29,8 +29,6 @@ def presign_upload(key: str, content_type: str, max_mb: int = 200, ttl: int = 36
         ["content-length-range", 0, max_bytes],
         ["starts-with", "$key", ""],              # or f"{settings.S3_INPUT_PREFIX}"
         ["starts-with", "$Content-Type", ""],     # allow any content type
-        # Optional hardening:
-        # {"bucket": settings.S3_BUCKET},
     ]
     return s3.generate_presigned_post(
         Bucket=settings.S3_BUCKET,
@@ -40,13 +38,25 @@ def presign_upload(key: str, content_type: str, max_mb: int = 200, ttl: int = 36
         ExpiresIn=ttl,
     )
 
-def presign_download(key: str, ttl: int = 3600):
+def presign_download(
+    key: str,
+    ttl: int = 3600,
+    *,
+    as_attachment: bool = False,
+    download_name: Optional[str] = None,
+):
     """
-    Generate a presigned GET URL for downloading an object.
+    Generate a presigned GET URL for downloading/streaming an object.
+    If as_attachment=True, add Content-Disposition: attachment to force download.
     """
+    params = {"Bucket": settings.S3_BUCKET, "Key": key}
+    if as_attachment:
+        if not download_name:
+            download_name = key.split("/")[-1] or "download"
+        params["ResponseContentDisposition"] = f'attachment; filename="{download_name}"'
     return s3.generate_presigned_url(
         ClientMethod="get_object",
-        Params={"Bucket": settings.S3_BUCKET, "Key": key},
+        Params=params,
         ExpiresIn=ttl,
     )
 
