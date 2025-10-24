@@ -16,8 +16,14 @@
 </head>
 <body>
   <h1>Vox-9 Web POC</h1>
-  <p class="muted">Single user. No accounts. Paste text, hit Generate.</p>
+  <p class="muted">Single user. No accounts. Paste text, hit Generate. Or upload a file to S3 first.</p>
 
+  <label>Upload audio/video to S3</label><br/>
+  <input type="file" id="file" accept="audio/*,video/*" />
+  <button id="upload">Upload to S3</button>
+  <div class="muted" id="upStatus">No upload yet</div>
+
+  <hr/>
   <label>Input text</label>
   <textarea id="text" placeholder="Paste your sample script here..."></textarea>
   <br/><br/>
@@ -29,18 +35,51 @@
   <pre id="out">(none)</pre>
 
   <script>
-    const apiBase = location.origin; // same host (Render)
+    const apiBase = location.origin;
     const statusEl = document.getElementById('status');
     const outEl = document.getElementById('out');
     const goBtn = document.getElementById('go');
     const textEl = document.getElementById('text');
+    const upStatus = document.getElementById('upStatus');
+    const fileEl = document.getElementById('file');
+
+    let uploadedKey = null;
+
+    async function presign(filename, type) {
+      const url = `${apiBase}/api/presign?filename=${encodeURIComponent(filename)}&content_type=${encodeURIComponent(type)}`;
+      const res = await fetch(url, { method: 'POST' });
+      if (!res.ok) throw new Error('presign failed');
+      return res.json();
+    }
+
+    async function s3Post(url, fields, file) {
+      const form = new FormData();
+      Object.entries(fields).forEach(([k,v]) => form.append(k, v));
+      form.append('file', file);
+      const r = await fetch(url, { method: 'POST', body: form });
+      if (!r.ok) throw new Error('S3 upload failed');
+    }
+
+    document.getElementById('upload').addEventListener('click', async () => {
+      const f = fileEl.files[0];
+      if (!f) { alert('Choose a file first'); return; }
+      try {
+        upStatus.textContent = 'Requesting presign...';
+        const ps = await presign(f.name, f.type || 'application/octet-stream');
+        await s3Post(ps.url, ps.fields, f);
+        uploadedKey = ps.fields.key;
+        upStatus.textContent = `Uploaded to S3 ✓ (${uploadedKey})`;
+      } catch (e) {
+        console.error(e);
+        upStatus.textContent = 'Upload failed';
+      }
+    });
 
     async function createJob(text) {
       const res = await fetch(`${apiBase}/api/jobs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        // Browser will prompt for HTTP Basic creds automatically on 401
-        body: JSON.stringify({ text })
+        body: JSON.stringify({ text, s3_input_key: uploadedKey })
       });
       return res.json();
     }
