@@ -1,9 +1,9 @@
 from pathlib import Path
 import re
 from datetime import datetime
-from typing import Dict
+from typing import Dict, List, Optional
 
-from fastapi import FastAPI, Depends, BackgroundTasks, Query
+from fastapi import FastAPI, Depends, BackgroundTasks, Query, Body
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,7 +12,11 @@ from sqlmodel import SQLModel, Session, create_engine, select
 from app.auth import single_user_guard
 from app.models import Job
 from app.pipeline_adapter import run_pipeline_adapter
-from app.storage import presign_upload, presign_download
+from app.storage import (
+    presign_upload,
+    presign_download,
+    list_objects,
+)
 from app.settings import settings
 
 app = FastAPI()
@@ -29,7 +33,6 @@ def root():
 def favicon():
     return FileResponse(str(STATIC_DIR / "favicon.ico"))
 
-# ----- Health (optional but handy) -----
 @app.get("/healthz", include_in_schema=False)
 def healthz():
     return {"ok": True}
@@ -37,7 +40,7 @@ def healthz():
 # ----- CORS (POC: permissive; tighten later) -----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # consider setting to your Render URL later
+    allow_origins=["*"],  # consider restricting to your Render domain later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -65,17 +68,13 @@ def update_job(job_id: str, **fields):
         s.refresh(job)
         return job
 
-# ----- S3 presign endpoints -----
+# ----- S3 presign & listing endpoints -----
 @app.post("/api/presign")
 def get_presign(
     filename: str = Query(...),
     content_type: str = Query("application/octet-stream"),
     _: None = Depends(single_user_guard),
 ):
-    """
-    Return a presigned POST for direct-to-S3 browser uploads.
-    """
-    # Sanitize filename to avoid policy mismatches
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename)
     key = f"{settings.S3_INPUT_PREFIX}{safe}"
     return presign_upload(key, content_type)
@@ -85,10 +84,25 @@ def get_presign_download(
     key: str = Query(..., description="S3 object key to download"),
     _: None = Depends(single_user_guard),
 ):
-    """
-    Return a presigned GET URL for downloading an S3 object.
-    """
     return {"url": presign_download(key)}
+
+@app.post("/api/presign_download_many")
+def presign_download_many(
+    payload: Dict = Body(...),
+    _: None = Depends(single_user_guard),
+):
+    keys: List[str] = payload.get("keys", [])
+    return {"links": [{"key": k, "url": presign_download(k)} for k in keys]}
+
+@app.get("/api/list_objects")
+def api_list_objects(
+    prefix: str = Query("inputs/", description="S3 prefix to list, e.g. inputs/ or outputs/"),
+    token: Optional[str] = Query(None, description="Pagination token"),
+    max_keys: int = Query(100, ge=1, le=1000),
+    _: None = Depends(single_user_guard),
+):
+    items, next_token = list_objects(prefix=prefix, continuation_token=token, max_keys=max_keys)
+    return {"items": items, "next_token": next_token}
 
 # ----- Job API -----
 @app.post("/api/jobs")
@@ -98,15 +112,14 @@ def create_job(payload: Dict, bg: BackgroundTasks, _: None = Depends(single_user
     { "text": "hello world", "s3_input_key": "inputs/foo.mp4" }
     """
     text = (payload or {}).get("text") or ""
-    # s3_input_key is optional for now; wire to your real pipeline later
-    # s3_key = (payload or {}).get("s3_input_key")
+    # s3_key = (payload or {}).get("s3_input_key")  # for future real processing
 
     job = save_job(Job(input_text=text, status="queued"))
 
     def run():
         try:
             update_job(job.id, status="running")
-            out = run_pipeline_adapter(text)  # swap in real processing
+            out = run_pipeline_adapter(text)  # swap in real processing later
             update_job(job.id, status="completed", output_text=out)
         except Exception as e:
             update_job(job.id, status="failed", error=str(e))
