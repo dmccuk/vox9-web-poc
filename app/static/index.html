@@ -52,12 +52,18 @@
       return res.json();
     }
 
+    // UPDATED: read and log S3's XML error body when upload fails
     async function s3Post(url, fields, file) {
       const form = new FormData();
-      Object.entries(fields).forEach(([k,v]) => form.append(k, v));
-      form.append('file', file);
-      const r = await fetch(url, { method: 'POST', body: form });
-      if (!r.ok) throw new Error('S3 upload failed');
+      Object.entries(fields).forEach(([k, v]) => form.append(k, v));
+      form.append("file", file);
+      const r = await fetch(url, { method: "POST", body: form });
+      const body = await r.text();            // 👈 capture S3 XML/response
+      if (!r.ok) {
+        console.error("S3 upload failed", r.status, body);
+        throw new Error("S3 upload failed");
+      }
+      return body;
     }
 
     document.getElementById('upload').addEventListener('click', async () => {
