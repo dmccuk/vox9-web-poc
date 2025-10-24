@@ -7,7 +7,6 @@ class Settings(BaseSettings):
     S3_BUCKET: str | None = None
     S3_INPUT_PREFIX: str = "inputs/"
     S3_OUTPUT_PREFIX: str = "outputs/"
-
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 settings = Settings()
