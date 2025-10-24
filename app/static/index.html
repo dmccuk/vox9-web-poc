@@ -8,7 +8,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { color-scheme: light dark; }
-    body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 820px; }
+    body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 1000px; }
     textarea { width: 100%; height: 8rem; }
     pre { background: #111; color: #eee; padding: 1rem; border-radius: 8px; overflow:auto; }
     button { padding: .6rem 1rem; border-radius: 8px; border: 0; background: #4f46e5; color: #fff; cursor: pointer; }
@@ -16,13 +16,19 @@
     .muted { color: #777; }
     .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
     .spacer { height: 1rem; }
+    table { width: 100%; border-collapse: collapse; margin-top: .5rem; }
+    th, td { border-bottom: 1px solid #333; padding: .5rem .25rem; text-align: left; }
+    th { font-weight: 600; }
+    code { background: rgba(0,0,0,.25); padding: .1rem .3rem; border-radius: 4px; }
     a { text-decoration: none; }
+    .right { text-align: right; }
   </style>
 </head>
 <body>
   <h1>Vox-9 Web POC</h1>
-  <p class="muted">Single user. Upload a file to S3 or just paste text and hit Generate.</p>
+  <p class="muted">Upload a file to S3, browse files, or just paste text and hit Generate.</p>
 
+  <!-- Upload -->
   <h3>Upload to S3</h3>
   <div class="row">
     <input type="file" id="file" accept="audio/*,video/*" />
@@ -30,6 +36,26 @@
   </div>
   <div class="muted" id="upStatus">No upload yet</div>
 
+  <!-- Bucket Browser -->
+  <div class="spacer"></div>
+  <h3>S3 Files</h3>
+  <div class="row">
+    <label for="prefix">Prefix:</label>
+    <select id="prefix">
+      <option value="inputs/">inputs/</option>
+      <option value="outputs/">outputs/</option>
+    </select>
+    <button id="listBtn">List Files</button>
+    <button id="downloadSelected" disabled>Download selected</button>
+    <button id="copyLinks" disabled>Copy links</button>
+    <span id="listStatus" class="muted"></span>
+  </div>
+  <div id="fileTableWrap"></div>
+  <div class="row">
+    <button id="loadMore" style="display:none">Load more</button>
+  </div>
+
+  <!-- Job -->
   <div class="spacer"></div>
   <h3>Run a job</h3>
   <label>Input text</label>
@@ -49,11 +75,22 @@
     const outEl = document.getElementById('out');
     const goBtn = document.getElementById('go');
     const textEl = document.getElementById('text');
-    const upStatus = document.getElementById('upStatus');
+
     const uploadBtn = document.getElementById('upload');
     const fileEl = document.getElementById('file');
+    const upStatus = document.getElementById('upStatus');
+
+    const prefixSel = document.getElementById('prefix');
+    const listBtn = document.getElementById('listBtn');
+    const listStatus = document.getElementById('listStatus');
+    const fileTableWrap = document.getElementById('fileTableWrap');
+    const loadMoreBtn = document.getElementById('loadMore');
+    const downloadSelectedBtn = document.getElementById('downloadSelected');
+    const copyLinksBtn = document.getElementById('copyLinks');
 
     let uploadedKey = null;
+    let listed = [];       // current items
+    let nextToken = null;  // pagination token
 
     async function presign(filename, type) {
       const url = `${apiBase}/api/presign?filename=${encodeURIComponent(filename)}&content_type=${encodeURIComponent(type)}`;
@@ -62,7 +99,6 @@
       return res.json(); // { url, fields }
     }
 
-    // Read and log S3's XML error body when upload fails (helps debugging)
     async function s3Post(url, fields, file) {
       const form = new FormData();
       Object.entries(fields).forEach(([k, v]) => form.append(k, v));
@@ -83,6 +119,65 @@
       return res.json(); // { url }
     }
 
+    async function listObjects(prefix, token=null) {
+      const url = new URL(`${apiBase}/api/list_objects`);
+      url.searchParams.set('prefix', prefix);
+      if (token) url.searchParams.set('token', token);
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('list failed');
+      return res.json(); // { items:[{key,size,last_modified}], next_token }
+    }
+
+    function renderTable(items) {
+      if (!items.length) {
+        fileTableWrap.innerHTML = '<div class="muted">No files found.</div>';
+        downloadSelectedBtn.disabled = true;
+        copyLinksBtn.disabled = true;
+        return;
+      }
+      const rows = items.map((it, idx) => {
+        const name = it.key.split('/').pop();
+        return `
+          <tr data-key="${it.key}">
+            <td><input type="checkbox" class="sel" data-key="${it.key}"></td>
+            <td><code title="${it.key}">${name}</code></td>
+            <td class="right">${(it.size/1024/1024).toFixed(2)} MB</td>
+            <td>${new Date(it.last_modified).toLocaleString()}</td>
+            <td><button class="viewBtn" data-key="${it.key}">View</button></td>
+          </tr>
+        `;
+      }).join('');
+      fileTableWrap.innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th></th><th>File</th><th class="right">Size</th><th>Modified</th><th>Action</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+
+      // enable/disable bulk actions based on selection
+      const selBoxes = [...fileTableWrap.querySelectorAll('.sel')];
+      const updateBulkButtons = () => {
+        const any = selBoxes.some(b => b.checked);
+        downloadSelectedBtn.disabled = !any;
+        copyLinksBtn.disabled = !any;
+      };
+      selBoxes.forEach(b => b.addEventListener('change', updateBulkButtons));
+      updateBulkButtons();
+
+      // wire per-row view buttons
+      fileTableWrap.querySelectorAll('.viewBtn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+          const key = e.currentTarget.getAttribute('data-key');
+          const dl = await presignDownload(key);
+          window.open(dl.url, '_blank', 'noopener');
+        });
+      });
+    }
+
     uploadBtn.addEventListener('click', async () => {
       const f = fileEl.files[0];
       if (!f) { alert('Choose a file first'); return; }
@@ -91,9 +186,7 @@
         upStatus.textContent = 'Requesting presign...';
         const ps = await presign(f.name, f.type || 'application/octet-stream');
         await s3Post(ps.url, ps.fields, f);
-        uploadedKey = ps.fields.key; // remember S3 object key
-
-        // Get a presigned GET link to this uploaded object
+        uploadedKey = ps.fields.key;
         const dl = await presignDownload(uploadedKey);
         upStatus.innerHTML = `Uploaded to S3 ✓ <code>${uploadedKey}</code><br/>
           <a href="${dl.url}" target="_blank" rel="noopener">Download / View (expires in ~1h)</a>`;
@@ -103,6 +196,71 @@
       } finally {
         uploadBtn.disabled = false;
       }
+    });
+
+    listBtn.addEventListener('click', async () => {
+      listStatus.textContent = 'Loading...';
+      try {
+        const prefix = prefixSel.value;
+        const res = await listObjects(prefix, null);
+        listed = res.items || [];
+        nextToken = res.next_token || null;
+        renderTable(listed);
+        loadMoreBtn.style.display = nextToken ? 'inline-block' : 'none';
+        listStatus.textContent = `${listed.length} file(s)`;
+      } catch (e) {
+        console.error(e);
+        listStatus.textContent = 'List failed';
+      }
+    });
+
+    loadMoreBtn.addEventListener('click', async () => {
+      if (!nextToken) return;
+      loadMoreBtn.disabled = true;
+      try {
+        const prefix = prefixSel.value;
+        const res = await listObjects(prefix, nextToken);
+        listed = listed.concat(res.items || []);
+        nextToken = res.next_token || null;
+        renderTable(listed);
+        loadMoreBtn.style.display = nextToken ? 'inline-block' : 'none';
+        listStatus.textContent = `${listed.length} file(s)`;
+      } catch (e) {
+        console.error(e);
+      } finally {
+        loadMoreBtn.disabled = false;
+      }
+    });
+
+    downloadSelectedBtn.addEventListener('click', async () => {
+      const keys = [...fileTableWrap.querySelectorAll('.sel:checked')].map(b => b.getAttribute('data-key'));
+      if (!keys.length) return;
+      // Request batch presigned links
+      const res = await fetch(`${apiBase}/api/presign_download_many`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ keys })
+      });
+      if (!res.ok) { alert('Failed to get links'); return; }
+      const data = await res.json();
+      // Open downloads in sequence (browsers may block too many at once)
+      for (const { url } of data.links) {
+        window.open(url, '_blank', 'noopener');
+        await new Promise(r => setTimeout(r, 200));
+      }
+    });
+
+    copyLinksBtn.addEventListener('click', async () => {
+      const keys = [...fileTableWrap.querySelectorAll('.sel:checked')].map(b => b.getAttribute('data-key'));
+      if (!keys.length) return;
+      const res = await fetch(`${apiBase}/api/presign_download_many`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ keys })
+      });
+      if (!res.ok) { alert('Failed to get links'); return; }
+      const data = await res.json();
+      const links = data.links.map(x => x.url).join('\n');
+      await navigator.clipboard.writeText(links);
+      alert('Copied presigned links to clipboard');
     });
 
     async function createJob(text) {
