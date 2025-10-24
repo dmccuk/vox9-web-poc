@@ -1,12 +1,11 @@
+# app/storage.py
+
 import boto3
 from botocore.config import Config
 from app.settings import settings
 
-
-# Explicitly configure region and signature version
 cfg = Config(signature_version="s3v4", region_name=settings.AWS_REGION)
 
-# Ensure we always hit the regional endpoint (not s3.amazonaws.com)
 s3 = boto3.client(
     "s3",
     region_name=settings.AWS_REGION,
@@ -14,13 +13,22 @@ s3 = boto3.client(
     config=cfg,
 )
 
-
 def presign_upload(key: str, content_type: str, max_mb: int = 200, ttl: int = 3600):
-    """
-    Generate a presigned POST URL for uploading directly to S3.
-    """
-    fields = {"Content-Type": content_type}
-    conditions = [["content-length-range", 0, max_mb * 1024 * 1024]]
+    max_bytes = max_mb * 1024 * 1024
+
+    fields = {
+        "Content-Type": content_type,
+        "key": key,
+    }
+
+    conditions = [
+        ["content-length-range", 0, max_bytes],
+        ["starts-with", "$key", ""],                # allow any key (or use your prefix)
+        ["starts-with", "$Content-Type", ""],       # 👈 allow Content-Type field
+        # Optional hardening (uncomment if you like):
+        # {"bucket": settings.S3_BUCKET},
+    ]
+
     return s3.generate_presigned_post(
         Bucket=settings.S3_BUCKET,
         Key=key,
@@ -29,11 +37,7 @@ def presign_upload(key: str, content_type: str, max_mb: int = 200, ttl: int = 36
         ExpiresIn=ttl,
     )
 
-
 def presign_download(key: str, ttl: int = 3600):
-    """
-    Generate a presigned URL for downloading an object from S3.
-    """
     return s3.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": settings.S3_BUCKET, "Key": key},
