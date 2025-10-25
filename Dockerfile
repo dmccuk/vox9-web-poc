@@ -1,13 +1,14 @@
 # Small, reliable base
 FROM python:3.11-slim
 
-# Keep Python quiet + unbuffered logs
+# Quiet Python + unbuffered logs
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# ffmpeg is handy for media work (keeps POC future-proof)
+# ffmpeg (with libass) + a reliable font
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    fonts-dejavu \
   && rm -rf /var/lib/apt/lists/*
 
 # App dir
@@ -23,8 +24,8 @@ COPY app ./app
 # Ensure package-style imports work (app.*)
 ENV PYTHONPATH=/app
 
-# Render will map the port; EXPOSE is just documentation
+# Documented port (Render autodetects)
 EXPOSE 8000
 
-# Start FastAPI with Uvicorn
+# Start FastAPI
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
