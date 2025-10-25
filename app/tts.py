@@ -1,4 +1,8 @@
-# app/tts.py
+"""
+Vox-9 TTS engine — synced captions from text using ElevenLabs
+Derived from the original Tkinter captions app, adapted for the FastAPI backend.
+"""
+
 import os
 import re
 import json
@@ -11,14 +15,14 @@ import requests
 from pydub import AudioSegment
 from pydub.utils import which
 
-# Make sure pydub sees ffmpeg/ffprobe in container
+# --- Ensure ffmpeg/ffprobe available ---
 AudioSegment.converter = which("ffmpeg")
 AudioSegment.ffprobe = which("ffprobe")
 
-# ---------- constants / defaults ----------
+# --- Defaults ---
 DEFAULT_FONT_NAME = "DejaVu Sans"
 DEFAULT_FONT_SIZE = 58
-DEFAULT_ALIGNMENT = 2         # bottom-centre
+DEFAULT_ALIGNMENT = 2  # bottom-centre
 DEFAULT_MARGIN_V = 60
 DEFAULT_OUTLINE = 3.0
 DEFAULT_SHADOW = 1.0
@@ -34,7 +38,7 @@ DEFAULT_PARAGRAPH_GAP_MS = 600
 
 ELEVEN_TTS_URL_TMPL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
 
-# ---------- helpers copied/trimmed from desktop app ----------
+# ---------- TEXT HELPERS ----------
 ASS_TAG_RE = re.compile(r"\{\\.*?\}")
 
 def clean_text(raw: str) -> str:
@@ -46,9 +50,8 @@ def clean_text(raw: str) -> str:
     lines = [ln.strip() for ln in t.split("\n")]
     return "\n".join(lines).strip()
 
-class SentencePiece(Tuple[str, bool]):  # (text, paragraph_break_before)
-    __slots__ = ()
 
+# ---------- SENTENCE SPLITTING ----------
 _NON_TERMINAL_ABBREVIATIONS = {"mr.", "mrs."}
 _COMMON_STARTERS = {"a","an","and","but","he","she","it","i","you","we","they","the","there","these","those","this"}
 
@@ -72,13 +75,13 @@ def split_into_sentences(text: str) -> List[Tuple[str, bool]]:
     seen_para = False
     for para in paras:
         p = para.strip()
-        if not p: 
+        if not p:
             continue
         parts = re.split(r"(?<=[\.!?])\s+", p)
         first_in_para = True
         for part in parts:
             part = part.strip()
-            if not part: 
+            if not part:
                 continue
             if out and not first_in_para and _ends_with_abbrev(out[-1][0]) and not _starts_like_new_sentence(part):
                 prev = out[-1]
@@ -89,6 +92,8 @@ def split_into_sentences(text: str) -> List[Tuple[str, bool]]:
         seen_para = True
     return out
 
+
+# ---------- TIMESTAMP HELPERS ----------
 def format_ts(seconds: float) -> str:
     seconds = max(0.0, seconds)
     h = int(seconds // 3600)
@@ -116,6 +121,8 @@ def ms_to_srt(ms: int) -> str:
 def normalize_caption_text(txt: str) -> str:
     return ASS_TAG_RE.sub("", txt.replace("\\N", "\n")).strip()
 
+
+# ---------- LINE SPLITTING ----------
 def _wrap_words_to_lines(words: list, max_chars: int) -> list:
     lines, line = [], ""
     for w in words:
@@ -139,6 +146,8 @@ def split_text_for_events(text: str, max_chars: int, max_lines: int) -> list:
         segs.append("\\N".join(lines[i:i+max_lines]))
     return segs
 
+
+# ---------- WRITE CAPTIONS ----------
 def write_ass(sub_path: Path, events: list, *, font_name: str, font_size: int, bold: bool,
               italic: bool, outline: float, shadow: float, alignment: int, margin_v: int) -> None:
     header = (
@@ -175,7 +184,8 @@ def write_srt(path: Path, events: List[Dict[str, str]]) -> None:
         out.append("")
     path.write_text("\n".join(out), encoding="utf-8")
 
-# ---------- ElevenLabs ----------
+
+# ---------- ELEVENLABS API ----------
 class ElevenAPI:
     def __init__(self, api_key: str):
         self.session = requests.Session()
@@ -197,7 +207,8 @@ class ElevenAPI:
         r.raise_for_status()
         return r.content
 
-# ---------- main entry ----------
+
+# ---------- MAIN ENTRY ----------
 def generate_assets_from_story(
     story_text: str,
     output_dir: Path,
@@ -208,7 +219,7 @@ def generate_assets_from_story(
     stability: float = 0.5,
     similarity_boost: float = 0.75,
     max_chars_per_line: int = DEFAULT_MAX_CHARS_PER_LINE,
-    max_lines_per_event: int = DEFAULT_LINES_PER_EVENT,   # keep at 1 for single-line captions
+    max_lines_per_event: int = DEFAULT_LINES_PER_EVENT,
     font_name: str = DEFAULT_FONT_NAME,
     font_size: int = DEFAULT_FONT_SIZE,
     bold: bool = True,
@@ -220,8 +231,8 @@ def generate_assets_from_story(
     paragraph_gap_ms: int = DEFAULT_PARAGRAPH_GAP_MS,
 ) -> Dict[str, str]:
     """
-    Synthesize sentence-by-sentence, measure actual durations, and create
-    ASS/SRT (1-line) perfectly aligned to the audio. Returns local paths.
+    Synthesize per sentence, measure actual durations, create synced captions.
+    Returns local file paths.
     """
     api_key = os.getenv("ELEVENLABS_API_KEY")
     if not api_key:
@@ -233,7 +244,6 @@ def generate_assets_from_story(
     if not pieces:
         raise RuntimeError("No sentences found after cleaning text")
 
-    # synth + measure true duration per sentence
     tmp = Path(tempfile.mkdtemp(prefix="vox9_tts_"))
     chunks: List[AudioSegment] = []
     durations: List[float] = []
@@ -248,7 +258,7 @@ def generate_assets_from_story(
         chunks.append(seg)
         durations.append(len(seg) / 1000.0)
 
-    # stitch full audio with gaps (and initial lead-in)
+    # --- Join audio with realistic gaps ---
     lead_in_ms = max(0, int(lead_in_ms))
     gap_ms = max(0, int(gap_ms))
     paragraph_gap_ms = max(gap_ms, int(paragraph_gap_ms))
@@ -259,7 +269,7 @@ def generate_assets_from_story(
             gaps_after.append(0)
         else:
             pause = gap_ms
-            if pieces[i+1][1]:  # paragraph break before next
+            if pieces[i+1][1]:
                 pause = max(pause, paragraph_gap_ms)
             gaps_after.append(pause)
 
@@ -269,7 +279,7 @@ def generate_assets_from_story(
         if pause_after > 0:
             full += AudioSegment.silent(duration=pause_after)
 
-    # write WAV + MP3
+    # --- Write WAV/MP3 ---
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = "narration"
@@ -281,7 +291,7 @@ def generate_assets_from_story(
     except Exception:
         mp3_path = None
 
-    # build caption events with lead-in/out per segment
+    # --- Build caption events ---
     t = max(0.0, lead_in_ms / 1000.0)
     caption_lead_in = max(0, int(caption_lead_in_ms)) / 1000.0
     caption_lead_out = max(0, int(caption_lead_out_ms)) / 1000.0
@@ -292,7 +302,6 @@ def generate_assets_from_story(
         sentence_start = t
         sentence_end = sentence_start + dur
 
-        # split long sentence into 1-line segments respecting max width
         seg_texts = split_text_for_events(sentence, max_chars_per_line, max_lines_per_event)
         weights = [max(len(s.replace("\\N", " ").strip()), 1) for s in seg_texts]
         total_w = sum(weights)
@@ -303,14 +312,9 @@ def generate_assets_from_story(
             if seg_end <= seg_start:
                 seg_end = seg_start + min_event
 
-            # lead-in/lead-out adjustments
-            start = max(0.0, seg_start - caption_lead_in) if caption_lead_in else seg_start
-            end = seg_end
-            if caption_lead_out:
-                desired_end = max(start + min_event, seg_end - caption_lead_out)
-                end = desired_end
+            start = max(0.0, seg_start - caption_lead_in)
+            end = max(start + min_event, seg_end - caption_lead_out)
 
-            # keep chronological with previous event
             if events and start < events[-1]["end_seconds"]:
                 start = events[-1]["end_seconds"]
                 if end <= start:
@@ -327,7 +331,7 @@ def generate_assets_from_story(
 
         t = sentence_end + (gap_after / 1000.0)
 
-    # write captions
+    # --- Write captions ---
     ass_path = output_dir / f"{stem}.ass"
     srt_path = output_dir / f"{stem}.srt"
     write_ass(
@@ -343,8 +347,8 @@ def generate_assets_from_story(
         margin_v=DEFAULT_MARGIN_V,
     )
     write_srt(srt_path, events)
+
     vtt_path = output_dir / f"{stem}.vtt"
-    # VTT is just SRT timing with dot separator
     vtt_lines = ["WEBVTT", ""]
     for ev in events:
         a = ms_to_srt(ass_to_ms(ev["start"])).replace(",", ".")
@@ -352,12 +356,12 @@ def generate_assets_from_story(
         vtt_lines += [f"{a} --> {b}", normalize_caption_text(ev["text"]), ""]
     vtt_path.write_text("\n".join(vtt_lines), encoding="utf-8")
 
-    # metadata (handy later to re-style)
-    (output_dir / f"{stem}_meta.json").write_text(json.dumps({
+    meta = {
         "wrap": {"max_chars": int(max_chars_per_line), "max_lines": int(max_lines_per_event)},
         "style": {"font": font_name, "size": int(font_size), "bold": bool(bold), "italic": bool(italic)},
         "counts": {"sentences": len(pieces), "characters": len(cleaned)},
-    }, indent=2), encoding="utf-8")
+    }
+    (output_dir / f"{stem}_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     return {
         "wav": str(wav_path),
@@ -366,3 +370,41 @@ def generate_assets_from_story(
         "srt": str(srt_path),
         "vtt": str(vtt_path),
     }
+
+
+# ---------- LIST VOICES ----------
+DEFAULT_FAVORITE_VOICES = [
+    ("Adam", "pNInz6obpgDQGcFmaJgB"),
+    ("Antoni", "ErXwobaYiN019PkySvjV"),
+    ("Jessie", "t0jbNlBVZ17f02VDIeMI"),
+    ("Dave - Texan middle aged", "3ozl8hsxdYYNRhFU44aP"),
+    ("Michael", "flq6f7yk4E4fJM5XTYuZ"),
+    ("Brian", "nPczCjzI2devNBz1zQrb"),
+]
+
+def list_voices():
+    """
+    Return all available ElevenLabs voices, or fallback defaults if API fails.
+    """
+    api_key = os.getenv("ELEVENLABS_API_KEY")
+    hdrs = {"xi-api-key": api_key} if api_key else {}
+    try:
+        if not api_key:
+            raise RuntimeError("no key")
+
+        r = requests.get("https://api.elevenlabs.io/v1/voices", headers=hdrs, timeout=30)
+        r.raise_for_status()
+        data = r.json() or {}
+        voices = data.get("voices") or []
+        out = []
+        for v in voices:
+            name = (v.get("name") or "").strip() or "Unnamed"
+            vid = (v.get("voice_id") or "").strip()
+            if vid:
+                out.append({"name": name, "voice_id": vid})
+        if out:
+            return {"voices": out}
+        raise RuntimeError("empty")
+    except Exception:
+        # fallback to favorites
+        return {"voices": [{"name": n, "voice_id": vid} for (n, vid) in DEFAULT_FAVORITE_VOICES]}
