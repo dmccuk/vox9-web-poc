@@ -1,12 +1,11 @@
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from datetime import datetime
 from typing import List, Tuple, Optional, Dict
 
 from app.settings import settings
 
-# Force v4 signing + regional endpoint to avoid redirects/CORS issues
+# v4 signing + regional endpoint
 cfg = Config(signature_version="s3v4", region_name=settings.AWS_REGION)
 s3 = boto3.client(
     "s3",
@@ -19,11 +18,14 @@ def put_object_bytes(key: str, content_type: str, data: bytes):
     s3.put_object(Bucket=settings.S3_BUCKET, Key=key, Body=data, ContentType=content_type)
     return key
 
+def get_object_text(key: str, encoding: str = "utf-8") -> str:
+    """Read an S3 object and return its text."""
+    resp = s3.get_object(Bucket=settings.S3_BUCKET, Key=key)
+    body = resp["Body"].read()
+    return body.decode(encoding, errors="replace")
+
 def presign_upload(key: str, content_type: str, max_mb: int = 200, ttl: int = 3600):
-    """
-    Generate a presigned POST for browser-based direct upload.
-    Includes Content-Type condition to avoid 'extra input fields' error.
-    """
+    """Presigned POST for browser direct uploads."""
     max_bytes = max_mb * 1024 * 1024
     fields = {"Content-Type": content_type, "key": key}
     conditions = [
@@ -46,10 +48,7 @@ def presign_download(
     as_attachment: bool = False,
     download_name: Optional[str] = None,
 ):
-    """
-    Generate a presigned GET URL for downloading/streaming an object.
-    If as_attachment=True, add Content-Disposition: attachment to force download.
-    """
+    """Presigned GET for download/stream."""
     params = {"Bucket": settings.S3_BUCKET, "Key": key}
     if as_attachment:
         if not download_name:
@@ -62,14 +61,9 @@ def presign_download(
     )
 
 def list_objects(prefix: str, continuation_token: Optional[str] = None, max_keys: int = 100) -> Tuple[List[Dict], Optional[str]]:
-    """
-    List S3 objects under a prefix with pagination.
-    Requires IAM permission: s3:ListBucket on the bucket (optionally scoped to the prefixes).
-    """
     kwargs = {"Bucket": settings.S3_BUCKET, "Prefix": prefix, "MaxKeys": max_keys}
     if continuation_token:
         kwargs["ContinuationToken"] = continuation_token
-
     try:
         resp = s3.list_objects_v2(**kwargs)
     except ClientError as e:
@@ -79,13 +73,12 @@ def list_objects(prefix: str, continuation_token: Optional[str] = None, max_keys
 
     items: List[Dict] = []
     for obj in resp.get("Contents", []) or []:
-        # Skip folder placeholders if any
         if obj["Key"].endswith("/") and obj.get("Size", 0) == 0:
             continue
         lm = obj.get("LastModified")
         items.append({
             "key": obj["Key"],
             "size": obj.get("Size", 0),
-            "last_modified": lm.isoformat() if hasattr(lm, "isoformat") else str(lm),
+            "last_modified": getattr(lm, "isoformat", lambda: str(lm))(),
         })
     return items, resp.get("NextContinuationToken")
