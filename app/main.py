@@ -1,5 +1,6 @@
 from pathlib import Path
 import re
+from uuid import uuid4
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -16,8 +17,10 @@ from app.storage import (
     presign_upload,
     presign_download,
     list_objects,
+    put_object_bytes,
 )
 from app.settings import settings
+from app.tts import synthesize_elevenlabs
 
 app = FastAPI()
 
@@ -123,7 +126,7 @@ def api_list_objects(
         # Return readable error so the browser shows it instead of a 500
         raise HTTPException(status_code=400, detail=str(e))
 
-# ----- Job API -----
+# ----- Text job API (demo) -----
 @app.post("/api/jobs")
 def create_job(payload: Dict, bg: BackgroundTasks, _: None = Depends(single_user_guard)):
     """
@@ -131,14 +134,12 @@ def create_job(payload: Dict, bg: BackgroundTasks, _: None = Depends(single_user
     { "text": "hello world", "s3_input_key": "inputs/foo.mp4" }
     """
     text = (payload or {}).get("text") or ""
-    # s3_key = (payload or {}).get("s3_input_key")  # wire to your real pipeline later
-
     job = save_job(Job(input_text=text, status="queued"))
 
     def run():
         try:
             update_job(job.id, status="running")
-            out = run_pipeline_adapter(text)  # swap in real processing later
+            out = run_pipeline_adapter(text)
             update_job(job.id, status="completed", output_text=out)
         except Exception as e:
             update_job(job.id, status="failed", error=str(e))
@@ -158,3 +159,34 @@ def job_status(job_id: str, _: None = Depends(single_user_guard)):
             "output_text": job.output_text,
             "error": job.error,
         }
+
+# ----- ElevenLabs TTS → S3 outputs/ -----
+@app.post("/api/tts")
+def tts_generate(
+    payload: Dict = Body(...),
+    _: None = Depends(single_user_guard),
+):
+    """
+    Request: { "text": "Hello world", "filename": "my_audio.mp3" (optional) }
+    Returns: { "s3_key": "...", "download_url": "..." }
+    """
+    text = (payload or {}).get("text", "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is required")
+
+    desired_name = (payload or {}).get("filename") or ""
+    ext = "mp3" if settings.ELEVEN_OUTPUT_FORMAT.lower() == "mp3" else "wav"
+    base = desired_name.rsplit(".", 1)[0] if desired_name else f"eleven_{uuid4().hex[:8]}"
+    fname = f"{base}.{ext}"
+    key = f"{settings.S3_OUTPUT_PREFIX}{fname}"
+
+    try:
+        audio = synthesize_elevenlabs(text)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TTS failed: {e}")
+
+    content_type = "audio/mpeg" if ext == "mp3" else "audio/wav"
+    put_object_bytes(key, content_type, audio)
+
+    url = presign_download(key, as_attachment=True, download_name=fname)
+    return {"s3_key": key, "download_url": url}
