@@ -1,20 +1,21 @@
 """
-Vox-9 asset pipeline (Phase 1)
-- TTS via ElevenLabs (mp3/wav)
-- Captions (SRT / ASS / VTT) with configurable style
-- Optional MP4 with burned-in ASS subtitles
+Vox-9 asset pipeline (compat layer)
+- Exposes DEFAULT_STYLE and generate_assets(...) for main.py
+- Internally uses tts.generate_assets_from_story (per-sentence timing)
+- Optionally renders MP4 burn-in using captions_toolkit.render_burned_mp4
 """
+
 from __future__ import annotations
+from pathlib import Path
 from typing import Dict, Optional, List
+import tempfile
 
-from app.tts import synthesize_elevenlabs
-from app.captions_toolkit import (
-    make_captions, write_srt, write_vtt, write_ass, render_burned_mp4
-)
+from app.tts import generate_assets_from_story  # new engine (per-sentence)
+from app.captions_toolkit import render_burned_mp4
 
-# Default style (matches your desktop defaults)
+# Default style (phase 1 defaults; UI can override later)
 DEFAULT_STYLE = {
-    "font": "Inter",
+    "font": "DejaVu Sans",     # reliable in container (fonts-dejavu)
     "size": 64,
     "bold": False,
     "italic": False,
@@ -27,7 +28,15 @@ def _style_from_payload(style: Optional[Dict]) -> Dict:
     s = dict(DEFAULT_STYLE)
     if not style:
         return s
-    s.update({k: v for k, v in style.items() if k in s})
+    for k in ("font", "size", "bold", "italic", "resolution", "layout"):
+        if k in style:
+            s[k] = style[k]
+    # normalize
+    s["size"] = int(s.get("size", 64))
+    s["bold"] = bool(s.get("bold", False))
+    s["italic"] = bool(s.get("italic", False))
+    s["resolution"] = str(s.get("resolution", "1080x1920"))
+    s["layout"] = str(s.get("layout", "9:16"))
     return s
 
 
@@ -39,54 +48,110 @@ def generate_assets(
     style: Optional[Dict] = None,
 ) -> Dict[str, bytes]:
     """
-    Returns a dict of { ext: bytes } where ext ∈ requested outputs.
+    Backward-compatible API used by main.py.
+    Returns { ext: bytes } for requested outputs.
+    Uses the new TTS engine to produce audio + captions with accurate timing.
     """
     req = {o.lower() for o in outputs}
+    cfg = _style_from_payload(style)
+
+    # Work dir
+    tmp_root = Path(tempfile.mkdtemp(prefix="vox9_pipeline_"))
+    work = tmp_root / "assets"
+    work.mkdir(parents=True, exist_ok=True)
+
+    # Run TTS + captions (writes narration.wav/mp3/ass/srt/vtt into work/)
+    paths = generate_assets_from_story(
+        story_text=story_text,
+        output_dir=work,
+        voice_id=voice_id or "",  # your main.py will pass default from settings if not provided
+        # Map style into TTS caption styling (ASS writer)
+        font_name=cfg["font"],
+        font_size=int(cfg["size"]),
+        bold=bool(cfg["bold"]),
+        italic=bool(cfg["italic"]),
+        # (We keep other defaults like lead-in/out from tts.py)
+    )
+
+    # Collect requested outputs
     have: Dict[str, bytes] = {}
 
-    # 1) captions (we always compute once; cheap)
-    segs = make_captions(story_text)["segs"]
-    cfg = _style_from_payload(style)
-    if "srt" in req:
-        have["srt"] = write_srt(segs).encode("utf-8")
-    if "vtt" in req:
-        have["vtt"] = write_vtt(segs).encode("utf-8")
-    if "ass" in req or "mp4" in req:
-        ass_text = write_ass(
-            segs,
-            font=cfg["font"], size=int(cfg["size"]),
-            bold=bool(cfg["bold"]), italic=bool(cfg["italic"]),
-            resolution=cfg["resolution"]
-        ).encode("utf-8")
-        have.setdefault("ass", ass_text)
+    # Helper to read if exists
+    def _read_if(p: Path) -> Optional[bytes]:
+        try:
+            if p and p.exists() and p.is_file():
+                return p.read_bytes()
+        except Exception:
+            pass
+        return None
 
-    # 2) audio
-    need_mp3 = "mp3" in req or "mp4" in req  # mp4 needs audio
-    need_wav = "wav" in req
-    if need_mp3 and not need_wav:
-        have["mp3"] = synthesize_elevenlabs(story_text, voice_id=voice_id, out_format="mp3")
-    elif need_wav and not need_mp3:
-        have["wav"] = synthesize_elevenlabs(story_text, voice_id=voice_id, out_format="wav")
-    elif need_mp3 and need_wav:
-        # ask EL for MP3 then transcode to WAV in the web tier later if desired
-        have["mp3"] = synthesize_elevenlabs(story_text, voice_id=voice_id, out_format="mp3")
-        # WAV not auto-transcoded here; earlier scaffold did it, but not strictly required for Phase 1
-        # If you’d like WAV always, uncomment the transcoding route in vox9_pipeline (or add pydub here).
-        # For now, if caller requested WAV too, ask EL directly:
-        have["wav"] = synthesize_elevenlabs(story_text, voice_id=voice_id, out_format="wav")
+    p_wav = Path(paths.get("wav", "")) if paths.get("wav") else None
+    p_mp3 = Path(paths.get("mp3", "")) if paths.get("mp3") else None
+    p_ass = Path(paths.get("ass", "")) if paths.get("ass") else None
+    p_srt = Path(paths.get("srt", "")) if paths.get("srt") else None
+    p_vtt = Path(paths.get("vtt", "")) if paths.get("vtt") else None
 
-    # 3) mp4 with burned-in subs (ASS)
+    if "wav" in req and p_wav:
+        b = _read_if(p_wav)
+        if b is not None:
+            have["wav"] = b
+
+    if "mp3" in req and p_mp3:
+        b = _read_if(p_mp3)
+        if b is not None:
+            have["mp3"] = b
+
+    if "ass" in req and p_ass:
+        b = _read_if(p_ass)
+        if b is not None:
+            have["ass"] = b
+
+    if "srt" in req and p_srt:
+        b = _read_if(p_srt)
+        if b is not None:
+            have["srt"] = b
+
+    if "vtt" in req and p_vtt:
+        b = _read_if(p_vtt)
+        if b is not None:
+            have["vtt"] = b
+
+    # Build MP4 if requested (burn-in ASS over black background; mux audio)
     if "mp4" in req:
-        audio_bytes = have.get("wav") or have.get("mp3")
+        # Prefer WAV for cleaner AAC encode; fallback to MP3
+        audio_bytes = None
+        audio_ext = "mp3"
+        if p_wav:
+            audio_bytes = _read_if(p_wav)
+            audio_ext = "wav" if audio_bytes else "mp3"
+        if audio_bytes is None and p_mp3:
+            audio_bytes = _read_if(p_mp3)
+            audio_ext = "mp3"
+
         if not audio_bytes:
             raise RuntimeError("MP4 requested but no audio was generated")
-        audio_ext = "wav" if have.get("wav") else "mp3"
+
+        ass_text = ""
+        if p_ass:
+            bt = _read_if(p_ass)
+            if bt:
+                ass_text = bt.decode("utf-8")
+        if not ass_text:
+            # If no ASS was produced for some reason, synth a trivial one-liner
+            ass_text = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n[V4+ Styles]\n" \
+                       "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, " \
+                       "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, " \
+                       "Alignment, MarginL, MarginR, MarginV, Encoding\n" \
+                       f"Style: Default,{cfg['font']},{cfg['size']},&H00FFFFFF,&H000000FF,&H00000000,&H80000000," \
+                       f"{-1 if cfg['bold'] else 0},{-1 if cfg['italic'] else 0},0,0,100,100,0,0,1,3,0,2,80,80,120,0\n\n" \
+                       "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+
         mp4 = render_burned_mp4(
-            audio_bytes,
-            have["ass"].decode("utf-8"),
+            audio_bytes=audio_bytes,
+            ass_text=ass_text,
             audio_ext=audio_ext,
             resolution=cfg["resolution"],
-            layout=cfg["layout"]
+            layout=cfg["layout"],
         )
         have["mp4"] = mp4
 
