@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Vox-9 — Generate Narration</title>
+  <title>Vox-9 — Generate Assets</title>
   <link rel="icon" type="image/x-icon" href="/static/favicon.ico" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
@@ -15,7 +15,7 @@
     .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
     button { padding: .6rem 1rem; border-radius: 10px; border: 0; background: #4f46e5; color: #fff; cursor: pointer; }
     button[disabled] { opacity: .6; cursor: not-allowed; }
-    .ghost { background: transparent; border: 1px solid #444; color: inherit; } /* ensure visible text */
+    .ghost { background: transparent; border: 1px solid #444; color: inherit; }
     .box { border: 2px dashed #555; border-radius: 12px; padding: 1.4rem; text-align: center; }
     .box.dragover { border-color: #4f46e5; background: rgba(79,70,229,.08); }
     table { width: 100%; border-collapse: collapse; }
@@ -26,10 +26,11 @@
     .crumbs { font-size: .9rem; margin-bottom: .4rem; }
     .crumbs a { color: inherit; }
     .spacer { height: .75rem; }
+    .results td:nth-child(1){ width: 120px; }
   </style>
 </head>
 <body>
-  <h1>Vox-9 — Generate Narration</h1>
+  <h1>Vox-9 — Generate Assets</h1>
   <div class="layout">
     <!-- LEFT: S3 Explorer -->
     <div class="panel">
@@ -69,8 +70,19 @@
       </div>
 
       <div class="spacer"></div>
+      <div>
+        <strong>Outputs:</strong>
+        <label><input type="checkbox" class="out" value="mp3" checked> MP3</label>
+        <label><input type="checkbox" class="out" value="wav"> WAV</label>
+        <label><input type="checkbox" class="out" value="srt" checked> SRT</label>
+        <label><input type="checkbox" class="out" value="ass"> ASS</label>
+        <label><input type="checkbox" class="out" value="vtt"> VTT</label>
+        <label><input type="checkbox" class="out" value="mp4"> MP4</label>
+      </div>
+
+      <div class="spacer"></div>
       <div class="row">
-        <button id="btnGenerate" disabled>Generate narration</button>
+        <button id="btnGenerate" disabled>Generate assets</button>
         <span id="genStatus" class="muted"></span>
       </div>
 
@@ -130,7 +142,6 @@
       const url = new URL(`${apiBase}/api/tree`);
       url.searchParams.set('prefix', prefix);
       const res = await fetch(url);
-      // tolerate 200 with an error field
       const data = await res.json().catch(()=>({folders:[],files:[],error:'Bad JSON'}));
       if (!res.ok) data.error = data.error || `HTTP ${res.status}`;
       return data; // {folders, files, error?}
@@ -168,6 +179,7 @@
                 <td>
                   <button class="useStory" data-key="${it.key}">Use as story</button>
                   <button class="dl" data-key="${it.key}">Download</button>
+                  <button class="rm" data-key="${it.key}">Delete</button>
                 </td>
               </tr>`);
             }
@@ -196,6 +208,22 @@
             btnGenerate.disabled = false;
           });
         });
+        explorer.querySelectorAll('.rm').forEach(btn=>{
+          btn.addEventListener('click', async ()=>{
+            const k = btn.getAttribute('data-key');
+            if (!confirm(`Delete ${k}? This can’t be undone.`)) return;
+            try {
+              const r = await fetch(`${apiBase}/api/object?key=${encodeURIComponent(k)}`, { method: 'DELETE' });
+              const d = await r.json();
+              if (!r.ok) throw new Error(d?.detail || 'Delete failed');
+              loadTree();
+            } catch (e) {
+              console.error(e);
+              alert('Delete failed');
+            }
+          });
+        });
+
       } catch (e) {
         explorer.innerHTML = '<div class="muted">Failed to load (unexpected)</div>';
         console.error(e);
@@ -249,7 +277,6 @@
         currentStoryKey = ps.fields.key;
         uploadStatus.innerHTML = `Uploaded ✓ <code>${file.name}</code> → <code>${currentStoryKey}</code>`;
         btnGenerate.disabled = false;
-        // Jump explorer to the project folder for convenience
         const parts = currentStoryKey.split('/'); // projects/<story>/<file>
         if (parts.length >= 3) {
           cwd = `projects/${parts[1]}/`;
@@ -279,27 +306,40 @@
     }
     btnVoices.addEventListener('click', loadVoices);
 
-    // ---------- Generate
+    // ---------- Generate assets
+    function selectedOutputs(){
+      return Array.from(document.querySelectorAll('input.out:checked')).map(i=>i.value);
+    }
+
     btnGenerate.addEventListener('click', async () => {
       if (!currentStoryKey) return;
+      const outs = selectedOutputs();
+      if (!outs.length) { alert('Select at least one output type.'); return; }
+
       btnGenerate.disabled = true;
       genStatus.textContent = 'Generating…';
       result.innerHTML = '';
       try {
         const voice_id = voiceSel.value || undefined;
-        const res = await fetch(`${apiBase}/api/tts_from_story`, {
+        const res = await fetch(`${apiBase}/api/generate_assets`, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ s3_story_key: currentStoryKey, voice_id })
+          body: JSON.stringify({ s3_story_key: currentStoryKey, voice_id, outputs: outs })
         });
         const data = await res.json();
-        if (!res.ok) throw new Error(data?.detail || 'TTS failed');
+        if (!res.ok) throw new Error(data?.detail || 'Generation failed');
+
+        const rows = (data.assets || []).map(a =>
+          `<tr><td>${a.type.toUpperCase()}</td><td><a href="${a.url}" download target="_blank" rel="noopener">${a.key.split('/').pop()}</a></td></tr>`
+        ).join('');
+        result.innerHTML = rows ? `<table class="results"><thead><tr><th>Type</th><th>Download</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted">No assets returned</div>';
+
         genStatus.textContent = 'Done ✓';
-        result.innerHTML = `<a href="${data.download_url}" download target="_blank" rel="noopener">Download narration</a>`;
-        loadTree(); // refresh to show the new asset
+        loadTree(); // refresh to show new assets
       } catch (e) {
         console.error(e);
         genStatus.textContent = 'Failed';
+        result.innerHTML = '<div class="muted">Generation failed</div>';
       } finally {
         btnGenerate.disabled = false;
       }
