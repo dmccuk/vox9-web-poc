@@ -7,47 +7,87 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root { color-scheme: light dark; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; max-width: 900px; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 1.5rem; }
+    .layout { display: grid; grid-template-columns: 320px 1fr; gap: 1rem; }
+    .panel { border: 1px solid #333; border-radius: 10px; padding: 1rem; }
+    h2 { margin: 0 0 .5rem; }
     .muted { color: #777; }
-    .box { border: 2px dashed #555; border-radius: 12px; padding: 2rem; text-align: center; }
-    .box.dragover { border-color: #4f46e5; background: rgba(79,70,229,.08); }
-    .row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
-    button { padding: .7rem 1.1rem; border-radius: 10px; border: 0; background: #4f46e5; color: #fff; cursor: pointer; }
+    .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+    button { padding: .6rem 1rem; border-radius: 10px; border: 0; background: #4f46e5; color: #fff; cursor: pointer; }
     button[disabled] { opacity: .6; cursor: not-allowed; }
-    .secondary { background: #2d2d2d; }
-    code { background: rgba(0,0,0,.25); padding: .15rem .35rem; border-radius: 6px; }
-    .spacer { height: 1rem; }
+    .ghost { background: transparent; border: 1px solid #444; }
+    .box { border: 2px dashed #555; border-radius: 12px; padding: 1.4rem; text-align: center; }
+    .box.dragover { border-color: #4f46e5; background: rgba(79,70,229,.08); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: .4rem .25rem; border-bottom: 1px solid #333; text-align: left; }
+    th { font-weight: 600; }
+    code { background: rgba(0,0,0,.25); padding: .1rem .3rem; border-radius: 6px; }
     a { text-decoration: none; }
+    .crumbs { font-size: .9rem; margin-bottom: .4rem; }
+    .crumbs a { color: inherit; }
+    .spacer { height: .75rem; }
   </style>
 </head>
 <body>
   <h1>Vox-9 — Generate Narration</h1>
-  <p class="muted">Drop a text/story file below. We’ll upload it to S3 and create a narration (MP3) using your default ElevenLabs voice.</p>
+  <div class="layout">
+    <!-- LEFT: S3 Explorer -->
+    <div class="panel">
+      <h2>Your Files</h2>
+      <div class="crumbs"><span id="crumbs"></span></div>
+      <div class="row">
+        <button id="btnHome" class="ghost">Home</button>
+        <button id="btnUp" class="ghost">Up</button>
+        <button id="btnRefresh" class="ghost">Refresh</button>
+      </div>
+      <div class="spacer"></div>
+      <div id="explorer"></div>
+    </div>
 
-  <!-- Drag & drop / picker -->
-  <div id="drop" class="box">
-    <div><strong>Drag & drop</strong> your <em>.txt / .srt / .ass</em> here</div>
-    <div class="spacer"></div>
-    <div class="row">
-      <input type="file" id="picker" accept=".txt,.srt,.ass,text/plain,text/*" />
-      <button id="btnChoose" class="secondary">Choose a file</button>
+    <!-- RIGHT: Upload + Generate -->
+    <div class="panel">
+      <h2>Upload Story & Generate</h2>
+      <p class="muted">Drop a text file or pick from your computer. Or select an existing story from the file browser.</p>
+
+      <div id="drop" class="box">
+        <div><strong>Drag & drop</strong> your <em>.txt / .srt / .ass</em> here</div>
+        <div class="spacer"></div>
+        <div class="row">
+          <input type="file" id="picker" accept=".txt,.srt,.ass,text/plain,text/*" />
+          <button id="btnChoose" class="ghost">Choose a file</button>
+        </div>
+      </div>
+
+      <div class="spacer"></div>
+      <div id="uploadStatus" class="muted">No file uploaded</div>
+
+      <div class="spacer"></div>
+      <div class="row">
+        <label>Voice:</label>
+        <select id="voice"></select>
+        <button id="btnVoices" class="ghost">Refresh voices</button>
+      </div>
+
+      <div class="spacer"></div>
+      <div class="row">
+        <button id="btnGenerate" disabled>Generate narration</button>
+        <span id="genStatus" class="muted"></span>
+      </div>
+
+      <div class="spacer"></div>
+      <div id="result"></div>
     </div>
   </div>
 
-  <div class="spacer"></div>
-  <div id="uploadStatus" class="muted">No file uploaded</div>
-
-  <div class="spacer"></div>
-  <div class="row">
-    <button id="btnGenerate" disabled>Generate narration</button>
-    <span id="genStatus" class="muted"></span>
-  </div>
-
-  <div class="spacer"></div>
-  <div id="result"></div>
-
   <script>
     const apiBase = location.origin;
+
+    // ---------- Elements
+    const explorer = document.getElementById('explorer');
+    const crumbsEl = document.getElementById('crumbs');
+    const btnHome = document.getElementById('btnHome');
+    const btnUp = document.getElementById('btnUp');
+    const btnRefresh = document.getElementById('btnRefresh');
 
     const drop = document.getElementById('drop');
     const picker = document.getElementById('picker');
@@ -57,11 +97,112 @@
     const genStatus = document.getElementById('genStatus');
     const result = document.getElementById('result');
 
-    let uploadedKey = null;     // S3 key of the story file
-    let uploadedName = null;    // original filename
+    const voiceSel = document.getElementById('voice');
+    const btnVoices = document.getElementById('btnVoices');
 
+    let cwd = 'projects/';     // current folder prefix
+    let uploadedKey = null;    // S3 key of uploaded story
+    let currentStoryKey = null;// story selected from explorer (or uploaded)
+    let voicesCache = [];
+
+    // ---------- Helpers
     function setDrag(el, on) { el.classList.toggle('dragover', on); }
+    function nameFromKey(key){ const parts = key.split('/').filter(Boolean); return parts[parts.length-1] || key; }
+    function parentPrefix(prefix){
+      const p = prefix.endsWith('/') ? prefix.slice(0, -1) : prefix;
+      const ix = p.lastIndexOf('/');
+      return ix >= 0 ? p.slice(0, ix+1) : '';
+    }
+    function renderCrumbs(prefix){
+      const parts = prefix.split('/').filter(Boolean);
+      let acc = '';
+      const links = ['<a href="#" data-pref="projects/">projects</a>'];
+      for (let i=1;i<parts.length;i++){
+        acc += parts[i] + '/';
+        links.push(`<span>/</span> <a href="#" data-pref="projects/${acc}">${parts[i]}</a>`);
+      }
+      crumbsEl.innerHTML = links.join(' ');
+      crumbsEl.querySelectorAll('a').forEach(a=>{
+        a.addEventListener('click', (e)=>{ e.preventDefault(); cwd = a.dataset.pref; loadTree(); });
+      });
+    }
 
+    // ---------- S3 Explorer
+    async function tree(prefix){
+      const url = new URL(`${apiBase}/api/tree`);
+      url.searchParams.set('prefix', prefix);
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('tree failed');
+      return res.json(); // {folders, files}
+    }
+
+    async function loadTree(){
+      renderCrumbs(cwd);
+      explorer.innerHTML = 'Loading…';
+      try {
+        const data = await tree(cwd);
+        const flds = data.folders || [];
+        const files = data.files || [];
+        const rows = [];
+        if (!flds.length && !files.length){
+          rows.push(`<div class="muted">Empty</div>`);
+        } else {
+          if (flds.length){
+            rows.push(`<table><thead><tr><th>Name</th><th></th></tr></thead><tbody>`);
+            for (const f of flds){
+              const n = nameFromKey(f.slice(0,-1));
+              rows.push(`<tr><td>📁 <a href="#" class="nav" data-pref="${f}">${n}</a></td><td></td></tr>`);
+            }
+            rows.push(`</tbody></table>`);
+          }
+          if (files.length){
+            rows.push(`<table><thead><tr><th>Name</th><th>Action</th></tr></thead><tbody>`);
+            for (const it of files){
+              const n = nameFromKey(it.key);
+              rows.push(`<tr>
+                <td>📄 ${n}</td>
+                <td>
+                  <button class="useStory" data-key="${it.key}">Use as story</button>
+                  <button class="dl" data-key="${it.key}">Download</button>
+                </td>
+              </tr>`);
+            }
+            rows.push(`</tbody></table>`);
+          }
+        }
+        explorer.innerHTML = rows.join('');
+
+        explorer.querySelectorAll('.nav').forEach(a=>{
+          a.addEventListener('click', (e)=>{ e.preventDefault(); cwd = a.dataset.pref; loadTree(); });
+        });
+        explorer.querySelectorAll('.dl').forEach(btn=>{
+          btn.addEventListener('click', async ()=>{
+            const k = btn.getAttribute('data-key');
+            const r = await fetch(`${apiBase}/api/presign_download?key=${encodeURIComponent(k)}`);
+            const d = await r.json();
+            const a = document.createElement('a');
+            a.href = d.url; a.download = ''; a.target = '_blank'; a.rel='noopener';
+            document.body.appendChild(a); a.click(); a.remove();
+          });
+        });
+        explorer.querySelectorAll('.useStory').forEach(btn=>{
+          btn.addEventListener('click', ()=>{
+            currentStoryKey = btn.getAttribute('data-key');
+            uploadStatus.innerHTML = `Story selected ✓ <code>${currentStoryKey}</code>`;
+            btnGenerate.disabled = false;
+          });
+        });
+      } catch (e) {
+        explorer.innerHTML = '<div class="muted">Failed to load</div>';
+        console.error(e);
+      }
+    }
+
+    btnHome.addEventListener('click', ()=>{ cwd = 'projects/'; loadTree(); });
+    btnUp.addEventListener('click', ()=>{ const p = parentPrefix(cwd); cwd = p || 'projects/'; loadTree(); });
+    btnRefresh.addEventListener('click', loadTree);
+
+    // ---------- Upload
     ['dragenter','dragover'].forEach(evt => drop.addEventListener(evt, e => { e.preventDefault(); e.stopPropagation(); setDrag(drop, true); }));
     ['dragleave','drop'].forEach(evt => drop.addEventListener(evt, e => { e.preventDefault(); e.stopPropagation(); setDrag(drop, false); }));
 
@@ -78,11 +219,10 @@
     });
 
     async function presignStory(filename, type) {
-      // Ask server to map filename → projects/<story>/<filename> and return S3 POST
       const url = `${apiBase}/api/presign_story?filename=${encodeURIComponent(filename)}&content_type=${encodeURIComponent(type || 'text/plain')}`;
       const res = await fetch(url, { method: 'POST' });
       if (!res.ok) throw new Error('presign failed');
-      return res.json(); // { url, fields }
+      return res.json();
     }
 
     async function s3Post(url, fields, file) {
@@ -91,10 +231,7 @@
       form.append('file', file);
       const r = await fetch(url, { method: 'POST', body: form });
       const body = await r.text();
-      if (!r.ok) {
-        console.error('S3 upload failed', r.status, body);
-        throw new Error('S3 upload failed');
-      }
+      if (!r.ok) { console.error('S3 upload failed', r.status, body); throw new Error('S3 upload failed'); }
       return body;
     }
 
@@ -102,43 +239,67 @@
       try {
         btnGenerate.disabled = true;
         result.innerHTML = '';
-        uploadedKey = null; uploadedName = null;
         uploadStatus.textContent = 'Requesting upload…';
         const ps = await presignStory(file.name, file.type || 'text/plain');
         await s3Post(ps.url, ps.fields, file);
-        uploadedKey = ps.fields.key;
-        uploadedName = file.name;
-        uploadStatus.innerHTML = `Uploaded ✓ <code>${uploadedName}</code> → <code>${uploadedKey}</code>`;
+        currentStoryKey = ps.fields.key;
+        uploadStatus.innerHTML = `Uploaded ✓ <code>${file.name}</code> → <code>${currentStoryKey}</code>`;
         btnGenerate.disabled = false;
+        // Jump explorer to the project folder for convenience
+        const parts = currentStoryKey.split('/'); // projects/<story>/<file>
+        if (parts.length >= 3) {
+          cwd = `projects/${parts[1]}/`;
+          loadTree();
+        }
       } catch (e) {
         console.error(e);
         uploadStatus.textContent = 'Upload failed';
       }
     }
 
+    // ---------- Voices
+    async function loadVoices(){
+      voiceSel.innerHTML = '<option value="">Loading…</option>';
+      const res = await fetch(`${apiBase}/api/voices`);
+      const data = await res.json();
+      voicesCache = data.voices || [];
+      const def = data.default_voice_id || '';
+      const opts = voicesCache.map(v => `<option value="${v.voice_id}">${v.name}</option>`).join('');
+      voiceSel.innerHTML = opts || '<option value="">(no voices)</option>';
+      if (def) voiceSel.value = def;
+    }
+    btnVoices.addEventListener('click', loadVoices);
+
+    // ---------- Generate
     btnGenerate.addEventListener('click', async () => {
-      if (!uploadedKey) return;
+      if (!currentStoryKey) return;
       btnGenerate.disabled = true;
       genStatus.textContent = 'Generating…';
       result.innerHTML = '';
       try {
+        const voice_id = voiceSel.value || undefined;
         const res = await fetch(`${apiBase}/api/tts_from_story`, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ s3_story_key: uploadedKey })
+          body: JSON.stringify({ s3_story_key: currentStoryKey, voice_id })
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data?.detail || 'TTS failed');
         genStatus.textContent = 'Done ✓';
         result.innerHTML = `<a href="${data.download_url}" download target="_blank" rel="noopener">Download narration</a>`;
+        loadTree(); // refresh to show the new asset
       } catch (e) {
         console.error(e);
         genStatus.textContent = 'Failed';
-        result.textContent = '';
       } finally {
         btnGenerate.disabled = false;
       }
     });
+
+    // ---------- Init
+    (async function init(){
+      await Promise.all([loadTree(), loadVoices()]);
+    })();
   </script>
 </body>
 </html>
