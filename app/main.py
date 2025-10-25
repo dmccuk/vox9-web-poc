@@ -55,17 +55,24 @@ def slug(s: str) -> str:
 # ---------- S3 Explorer APIs ----------
 @app.get("/api/tree")
 def api_tree(
-    prefix: str = Query("projects/", description="Folder prefix ending with '/'"),
+    prefix: str = Query("projects/", description="Folder prefix (e.g. 'projects/' or 'projects/my-story/')"),
     token: Optional[str] = Query(None),
     max_keys: int = Query(200, ge=1, le=1000),
     _: None = Depends(single_user_guard),
 ):
+    """
+    Tolerant folder-style listing. Always returns 200 with:
+    { folders: [...], files: [...], next_token: "...", error: "..." (optional) }
+    """
     try:
         if not prefix.endswith("/"):
             prefix = prefix + "/"
-        return list_tree(prefix=prefix, continuation_token=token, max_keys=max_keys)
+        data = list_tree(prefix=prefix, continuation_token=token, max_keys=max_keys)
+        data.setdefault("error", None)
+        return data
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        # Don't block the UI — return an empty listing plus an error message
+        return {"folders": [], "files": [], "next_token": None, "error": str(e)}
 
 @app.get("/api/presign_download")
 def api_presign_download(key: str = Query(...), _: None = Depends(single_user_guard)):
