@@ -19,13 +19,11 @@ def put_object_bytes(key: str, content_type: str, data: bytes):
     return key
 
 def get_object_text(key: str, encoding: str = "utf-8") -> str:
-    """Read an S3 object and return its text."""
     resp = s3.get_object(Bucket=settings.S3_BUCKET, Key=key)
     body = resp["Body"].read()
     return body.decode(encoding, errors="replace")
 
 def presign_upload(key: str, content_type: str, max_mb: int = 200, ttl: int = 3600):
-    """Presigned POST for browser direct uploads."""
     max_bytes = max_mb * 1024 * 1024
     fields = {"Content-Type": content_type, "key": key}
     conditions = [
@@ -48,17 +46,12 @@ def presign_download(
     as_attachment: bool = False,
     download_name: Optional[str] = None,
 ):
-    """Presigned GET for download/stream."""
     params = {"Bucket": settings.S3_BUCKET, "Key": key}
     if as_attachment:
         if not download_name:
             download_name = key.split("/")[-1] or "download"
         params["ResponseContentDisposition"] = f'attachment; filename="{download_name}"'
-    return s3.generate_presigned_url(
-        ClientMethod="get_object",
-        Params=params,
-        ExpiresIn=ttl,
-    )
+    return s3.generate_presigned_url("get_object", Params=params, ExpiresIn=ttl)
 
 def list_objects(prefix: str, continuation_token: Optional[str] = None, max_keys: int = 100) -> Tuple[List[Dict], Optional[str]]:
     kwargs = {"Bucket": settings.S3_BUCKET, "Prefix": prefix, "MaxKeys": max_keys}
@@ -82,3 +75,38 @@ def list_objects(prefix: str, continuation_token: Optional[str] = None, max_keys
             "last_modified": getattr(lm, "isoformat", lambda: str(lm))(),
         })
     return items, resp.get("NextContinuationToken")
+
+def list_tree(prefix: str, continuation_token: Optional[str] = None, max_keys: int = 100) -> Dict:
+    """
+    Folder-style listing using Delimiter='/'.
+    Returns { 'folders': [ 'projects/foo/' ...], 'files': [{key,size,last_modified}], 'next_token': '...' }
+    """
+    kwargs = {
+        "Bucket": settings.S3_BUCKET,
+        "Prefix": prefix,
+        "Delimiter": "/",
+        "MaxKeys": max_keys,
+    }
+    if continuation_token:
+        kwargs["ContinuationToken"] = continuation_token
+    try:
+        resp = s3.list_objects_v2(**kwargs)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        msg = e.response.get("Error", {}).get("Message")
+        raise RuntimeError(f"S3 Tree error: {code} {msg}")
+
+    folders = [cp["Prefix"] for cp in resp.get("CommonPrefixes", []) or []]
+    files: List[Dict] = []
+    for obj in resp.get("Contents", []) or []:
+        if obj["Key"] == prefix:
+            continue
+        if obj["Key"].endswith("/") and obj.get("Size", 0) == 0:
+            continue
+        lm = obj.get("LastModified")
+        files.append({
+            "key": obj["Key"],
+            "size": obj.get("Size", 0),
+            "last_modified": getattr(lm, "isoformat", lambda: str(lm))(),
+        })
+    return {"folders": folders, "files": files, "next_token": resp.get("NextContinuationToken")}
