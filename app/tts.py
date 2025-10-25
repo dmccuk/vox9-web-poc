@@ -20,9 +20,16 @@ DEFAULT_FAVORITE_VOICES: List[Tuple[str, str]] = [
     ("Brian", "nPczCjzI2devNBz1zQrb"),
 ]
 
-def synthesize_elevenlabs(text: str, voice_id: Optional[str] = None, *, max_retries: int = 2) -> bytes:
+def synthesize_elevenlabs(
+    text: str,
+    voice_id: Optional[str] = None,
+    *,
+    out_format: Optional[str] = None,
+    max_retries: int = 2
+) -> bytes:
     """
     Synthesize speech via ElevenLabs TTS.
+    out_format: 'mp3' or 'wav' (defaults to settings.ELEVEN_OUTPUT_FORMAT)
     Retries lightly on transient 429/system_busy.
     """
     api_key = settings.ELEVEN_API_KEY
@@ -32,7 +39,9 @@ def synthesize_elevenlabs(text: str, voice_id: Optional[str] = None, *, max_retr
     if not voice_id:
         raise RuntimeError("ELEVEN_VOICE_ID not set (or provide voice_id in request)")
 
-    output_format = _FORMAT_TO_EL_OUT.get(settings.ELEVEN_OUTPUT_FORMAT.lower(), "mp3_44100_128")
+    fmt = (out_format or settings.ELEVEN_OUTPUT_FORMAT or "mp3").lower()
+    output_format = _FORMAT_TO_EL_OUT.get(fmt, "mp3_44100_128")
+
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
     headers = {
         "xi-api-key": api_key,
@@ -43,8 +52,6 @@ def synthesize_elevenlabs(text: str, voice_id: Optional[str] = None, *, max_retr
         "text": text,
         "model_id": settings.ELEVEN_MODEL_ID,
         "output_format": output_format,
-        # Add voice_settings here later if you want:
-        # "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
     }
 
     for i in range(max_retries + 1):
