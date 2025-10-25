@@ -1,13 +1,12 @@
 """
 Vox-9 TTS engine — synced captions from text using ElevenLabs
-Derived from the original Tkinter captions app, adapted for the FastAPI backend.
+Single-line captions that never overflow: we split by *pixel* width.
 """
 
 import os
 import re
 import json
 import tempfile
-import subprocess
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
@@ -15,26 +14,36 @@ import requests
 from pydub import AudioSegment
 from pydub.utils import which
 
-# --- Ensure ffmpeg/ffprobe available ---
+# Ensure ffmpeg/ffprobe available for pydub
 AudioSegment.converter = which("ffmpeg")
 AudioSegment.ffprobe = which("ffprobe")
 
-# --- Defaults ---
+# --- Defaults (you can tune these) ---
 DEFAULT_FONT_NAME = "Calibri"
 DEFAULT_FONT_SIZE = 65
-DEFAULT_ALIGNMENT = 2  # bottom-centre
+DEFAULT_ALIGNMENT = 2           # bottom-centre
 DEFAULT_MARGIN_V = 30
+DEFAULT_MARGIN_L = 80
+DEFAULT_MARGIN_R = 80
 DEFAULT_OUTLINE = 3.0
-DEFAULT_SHADOW = 1.0
+DEFAULT_SHADOW  = 1.0
 
+# Upper bound you prefer; pixel-fit may reduce this to avoid overflow
 DEFAULT_MAX_CHARS_PER_LINE = 65
-DEFAULT_LINES_PER_EVENT = 1
+DEFAULT_LINES_PER_EVENT    = 1    # keep single-line
 
-DEFAULT_LEAD_IN_MS = 250
-DEFAULT_CAPTION_LEAD_IN_MS = 50
-DEFAULT_CAPTION_LEAD_OUT_MS = 120
-DEFAULT_GAP_MS = 150
-DEFAULT_PARAGRAPH_GAP_MS = 600
+# Estimate average glyph width as fraction of font size (Calibri ~0.50–0.56)
+DEFAULT_CHAR_WIDTH_FACTOR  = 0.52
+
+# Timing
+DEFAULT_LEAD_IN_MS            = 250
+DEFAULT_CAPTION_LEAD_IN_MS    = 50
+DEFAULT_CAPTION_LEAD_OUT_MS   = 120
+DEFAULT_GAP_MS                = 150
+DEFAULT_PARAGRAPH_GAP_MS      = 600
+
+# Video resolution the captions are designed for (affects fit calc + ASS PlayRes)
+DEFAULT_RESOLUTION = "1920x1080"     # change to "1080x1920" for vertical
 
 ELEVEN_TTS_URL_TMPL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
 
@@ -49,7 +58,6 @@ def clean_text(raw: str) -> str:
     t = re.sub(r"\n{3,}", "\n\n", t)
     lines = [ln.strip() for ln in t.split("\n")]
     return "\n".join(lines).strip()
-
 
 # ---------- SENTENCE SPLITTING ----------
 _NON_TERMINAL_ABBREVIATIONS = {"mr.", "mrs."}
@@ -92,13 +100,10 @@ def split_into_sentences(text: str) -> List[Tuple[str, bool]]:
         seen_para = True
     return out
 
-
 # ---------- TIMESTAMP HELPERS ----------
 def format_ts(seconds: float) -> str:
     seconds = max(0.0, seconds)
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
+    h = int(seconds // 3600); m = int((seconds % 3600) // 60); s = int(seconds % 60)
     cs = int(round((seconds - int(seconds)) * 100))
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
@@ -112,17 +117,34 @@ def ass_to_ms(ts_ass: str) -> int:
 
 def ms_to_srt(ms: int) -> str:
     ms = max(0, int(ms))
-    h = ms // 3_600_000
-    m = (ms % 3_600_000) // 60_000
-    s = (ms % 60_000) // 1000
-    rem = ms % 1000
+    h = ms // 3_600_000; m = (ms % 3_600_000) // 60_000; s = (ms % 60_000) // 1000; rem = ms % 1000
     return f"{h:02d}:{m:02d}:{s:02d},{rem:03d}"
 
 def normalize_caption_text(txt: str) -> str:
     return ASS_TAG_RE.sub("", txt.replace("\\N", "\n")).strip()
 
+# ---------- WIDTH ESTIMATION + LINE SPLITTING ----------
+def _parse_resolution(res: str) -> Tuple[int,int]:
+    try:
+        w, h = res.lower().split("x")
+        return int(w), int(h)
+    except Exception:
+        return (1920, 1080)
 
-# ---------- LINE SPLITTING ----------
+def _estimate_max_cols(
+    *,
+    resolution: str,
+    margin_l: int,
+    margin_r: int,
+    font_px: int,
+    char_width_factor: float,
+) -> int:
+    w, _ = _parse_resolution(resolution)
+    usable = max(40, w - margin_l - margin_r)
+    avg_px = max(10.0, font_px * max(0.35, min(0.9, float(char_width_factor))))
+    cols = int(usable / avg_px)
+    return max(18, min(120, cols))
+
 def _wrap_words_to_lines(words: list, max_chars: int) -> list:
     lines, line = [], ""
     for w in words:
@@ -130,31 +152,58 @@ def _wrap_words_to_lines(words: list, max_chars: int) -> list:
         if len(cand) <= max_chars or not line:
             line = cand
         else:
-            lines.append(line)
-            line = w
-    if line:
-        lines.append(line)
+            lines.append(line); line = w
+    if line: lines.append(line)
     return lines
 
-def split_text_for_events(text: str, max_chars: int, max_lines: int) -> list:
+def split_text_for_events_single_line(
+    text: str,
+    *,
+    resolution: str,
+    margin_l: int,
+    margin_r: int,
+    font_px: int,
+    char_width_factor: float,
+    max_chars_preference: int,
+) -> List[str]:
+    """
+    Returns sequential single-line segments that do NOT overflow.
+    Uses min(preferred_chars, pixel-fit estimate).
+    """
+    effective_max = min(
+        int(max_chars_preference),
+        _estimate_max_cols(
+            resolution=resolution,
+            margin_l=margin_l, margin_r=margin_r,
+            font_px=font_px, char_width_factor=char_width_factor,
+        )
+    )
     words = text.split()
-    lines = _wrap_words_to_lines(words, max_chars)
-    if not lines:
-        return [""]
-    segs = []
-    for i in range(0, len(lines), max_lines):
-        segs.append("\\N".join(lines[i:i+max_lines]))
-    return segs
-
+    return _wrap_words_to_lines(words, effective_max) or [""]
 
 # ---------- WRITE CAPTIONS ----------
-def write_ass(sub_path: Path, events: list, *, font_name: str, font_size: int, bold: bool,
-              italic: bool, outline: float, shadow: float, alignment: int, margin_v: int) -> None:
+def write_ass(
+    sub_path: Path,
+    events: list,
+    *,
+    font_name: str,
+    font_size: int,
+    bold: bool,
+    italic: bool,
+    outline: float,
+    shadow: float,
+    alignment: int,
+    margin_v: int,
+    margin_l: int,
+    margin_r: int,
+    resolution: str,
+) -> None:
+    w, h = _parse_resolution(resolution)
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
-        "PlayResX: 1920\n"
-        "PlayResY: 1080\n"
+        f"PlayResX: {w}\n"
+        f"PlayResY: {h}\n"
         "ScaledBorderAndShadow: yes\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
@@ -165,25 +214,13 @@ def write_ass(sub_path: Path, events: list, *, font_name: str, font_size: int, b
         "Style: Default,"
         f"{font_name},{int(font_size)},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,"
         f"{-1 if bold else 0},{-1 if italic else 0},0,0,100,100,0,0,1,"
-        f"{outline},{shadow},{alignment},80,80,{margin_v},0"
+        f"{outline},{shadow},{alignment},{margin_l},{margin_r},{margin_v},0"
     )
     events_hdr = "\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
     lines = [header + style + events_hdr]
     for ev in events:
         lines.append(f"Dialogue: 0,{ev['start']},{ev['end']},Default,,0,0,0,,{ev['text']}")
     sub_path.write_text("\n".join(lines), encoding="utf-8")
-
-def write_srt(path: Path, events: List[Dict[str, str]]) -> None:
-    out = []
-    for i, ev in enumerate(events, 1):
-        a = ass_to_ms(ev["start"]); b = ass_to_ms(ev["end"])
-        if b <= a: b = a + 10
-        out.append(str(i))
-        out.append(f"{ms_to_srt(a)} --> {ms_to_srt(b)}")
-        out.append(normalize_caption_text(ev["text"]))
-        out.append("")
-    path.write_text("\n".join(out), encoding="utf-8")
-
 
 # ---------- ELEVENLABS API ----------
 class ElevenAPI:
@@ -207,7 +244,6 @@ class ElevenAPI:
         r.raise_for_status()
         return r.content
 
-
 # ---------- MAIN ENTRY ----------
 def generate_assets_from_story(
     story_text: str,
@@ -219,7 +255,8 @@ def generate_assets_from_story(
     stability: float = 0.5,
     similarity_boost: float = 0.75,
     max_chars_per_line: int = DEFAULT_MAX_CHARS_PER_LINE,
-    max_lines_per_event: int = DEFAULT_LINES_PER_EVENT,
+    max_lines_per_event: int = DEFAULT_LINES_PER_EVENT,  # keep as 1
+    char_width_factor: float = DEFAULT_CHAR_WIDTH_FACTOR,
     font_name: str = DEFAULT_FONT_NAME,
     font_size: int = DEFAULT_FONT_SIZE,
     bold: bool = True,
@@ -229,10 +266,13 @@ def generate_assets_from_story(
     caption_lead_out_ms: int = DEFAULT_CAPTION_LEAD_OUT_MS,
     gap_ms: int = DEFAULT_GAP_MS,
     paragraph_gap_ms: int = DEFAULT_PARAGRAPH_GAP_MS,
+    resolution: str = DEFAULT_RESOLUTION,
+    margin_l: int = DEFAULT_MARGIN_L,
+    margin_r: int = DEFAULT_MARGIN_R,
 ) -> Dict[str, str]:
     """
-    Synthesize per sentence, measure actual durations, create synced captions.
-    Returns local file paths.
+    Synthesize per sentence, measure durations, and create single-line captions
+    that never overflow horizontally.
     """
     api_key = os.getenv("ELEVEN_API_KEY")
     if not api_key:
@@ -255,10 +295,9 @@ def generate_assets_from_story(
         mp3_path = tmp / f"chunk_{idx:04d}.mp3"
         mp3_path.write_bytes(mp3)
         seg = AudioSegment.from_file(mp3_path, format="mp3")
-        chunks.append(seg)
-        durations.append(len(seg) / 1000.0)
+        chunks.append(seg); durations.append(len(seg) / 1000.0)
 
-    # --- Join audio with realistic gaps ---
+    # Join with gaps
     lead_in_ms = max(0, int(lead_in_ms))
     gap_ms = max(0, int(gap_ms))
     paragraph_gap_ms = max(gap_ms, int(paragraph_gap_ms))
@@ -279,9 +318,8 @@ def generate_assets_from_story(
         if pause_after > 0:
             full += AudioSegment.silent(duration=pause_after)
 
-    # --- Write WAV/MP3 ---
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Write WAV/MP3
+    output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
     stem = "narration"
     wav_path = output_dir / f"{stem}.wav"
     mp3_path = output_dir / f"{stem}.mp3"
@@ -291,7 +329,7 @@ def generate_assets_from_story(
     except Exception:
         mp3_path = None
 
-    # --- Build caption events ---
+    # Build caption events
     t = max(0.0, lead_in_ms / 1000.0)
     caption_lead_in = max(0, int(caption_lead_in_ms)) / 1000.0
     caption_lead_out = max(0, int(caption_lead_out_ms)) / 1000.0
@@ -300,9 +338,16 @@ def generate_assets_from_story(
     events = []
     for (sentence, _pb), dur, gap_after in zip(pieces, durations, gaps_after):
         sentence_start = t
-        sentence_end = sentence_start + dur
+        sentence_end   = sentence_start + dur
 
-        seg_texts = split_text_for_events(sentence, max_chars_per_line, max_lines_per_event)
+        seg_texts = split_text_for_events_single_line(
+            sentence,
+            resolution=resolution,
+            margin_l=margin_l, margin_r=margin_r,
+            font_px=int(font_size),
+            char_width_factor=float(char_width_factor),
+            max_chars_preference=int(max_chars_per_line),
+        )
         weights = [max(len(s.replace("\\N", " ").strip()), 1) for s in seg_texts]
         total_w = sum(weights)
 
@@ -313,7 +358,7 @@ def generate_assets_from_story(
                 seg_end = seg_start + min_event
 
             start = max(0.0, seg_start - caption_lead_in)
-            end = max(start + min_event, seg_end - caption_lead_out)
+            end   = max(start + min_event, seg_end - caption_lead_out)
 
             if events and start < events[-1]["end_seconds"]:
                 start = events[-1]["end_seconds"]
@@ -322,32 +367,35 @@ def generate_assets_from_story(
 
             events.append({
                 "start": format_ts(start),
-                "end": format_ts(end),
+                "end":   format_ts(end),
                 "start_seconds": start,
-                "end_seconds": end,
+                "end_seconds":   end,
                 "text": seg_text,
             })
             seg_start = seg_end
 
         t = sentence_end + (gap_after / 1000.0)
 
-    # --- Write captions ---
+    # Write captions (ASS/SRT/VTT)
     ass_path = output_dir / f"{stem}.ass"
     srt_path = output_dir / f"{stem}.srt"
     write_ass(
-        ass_path,
-        events,
-        font_name=font_name,
-        font_size=int(font_size),
-        bold=bool(bold),
-        italic=bool(italic),
-        outline=DEFAULT_OUTLINE,
-        shadow=DEFAULT_SHADOW,
+        ass_path, events,
+        font_name=font_name, font_size=int(font_size),
+        bold=bool(bold), italic=bool(italic),
+        outline=DEFAULT_OUTLINE, shadow=DEFAULT_SHADOW,
         alignment=DEFAULT_ALIGNMENT,
         margin_v=DEFAULT_MARGIN_V,
+        margin_l=margin_l, margin_r=margin_r,
+        resolution=resolution,
     )
-    write_srt(srt_path, events)
-
+    # SRT
+    out_srt = []
+    for i, ev in enumerate(events, 1):
+        a = ass_to_ms(ev["start"]); b = ass_to_ms(ev["end"]); b = max(b, a+10)
+        out_srt += [str(i), f"{ms_to_srt(a)} --> {ms_to_srt(b)}", normalize_caption_text(ev["text"]), ""]
+    srt_path.write_text("\n".join(out_srt), encoding="utf-8")
+    # VTT
     vtt_path = output_dir / f"{stem}.vtt"
     vtt_lines = ["WEBVTT", ""]
     for ev in events:
@@ -357,8 +405,16 @@ def generate_assets_from_story(
     vtt_path.write_text("\n".join(vtt_lines), encoding="utf-8")
 
     meta = {
-        "wrap": {"max_chars": int(max_chars_per_line), "max_lines": int(max_lines_per_event)},
-        "style": {"font": font_name, "size": int(font_size), "bold": bool(bold), "italic": bool(italic)},
+        "wrap": {
+            "max_chars": int(max_chars_per_line),
+            "char_width_factor": float(char_width_factor)
+        },
+        "style": {
+            "font": font_name, "size": int(font_size),
+            "bold": bool(bold), "italic": bool(italic),
+            "resolution": resolution,
+            "margins": {"l": margin_l, "r": margin_r, "v": DEFAULT_MARGIN_V},
+        },
         "counts": {"sentences": len(pieces), "characters": len(cleaned)},
     }
     (output_dir / f"{stem}_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -371,7 +427,6 @@ def generate_assets_from_story(
         "vtt": str(vtt_path),
     }
 
-
 # ---------- LIST VOICES ----------
 DEFAULT_FAVORITE_VOICES = [
     ("Adam", "pNInz6obpgDQGcFmaJgB"),
@@ -383,28 +438,16 @@ DEFAULT_FAVORITE_VOICES = [
 ]
 
 def list_voices():
-    """
-    Return all available ElevenLabs voices, or fallback defaults if API fails.
-    """
     api_key = os.getenv("ELEVEN_API_KEY")
     hdrs = {"xi-api-key": api_key} if api_key else {}
     try:
         if not api_key:
             raise RuntimeError("no key")
-
         r = requests.get("https://api.elevenlabs.io/v1/voices", headers=hdrs, timeout=30)
         r.raise_for_status()
-        data = r.json() or {}
-        voices = data.get("voices") or []
-        out = []
-        for v in voices:
-            name = (v.get("name") or "").strip() or "Unnamed"
-            vid = (v.get("voice_id") or "").strip()
-            if vid:
-                out.append({"name": name, "voice_id": vid})
-        if out:
-            return {"voices": out}
-        raise RuntimeError("empty")
+        data = r.json() or {}; voices = data.get("voices") or []
+        out = [{"name": (v.get("name") or "Unnamed").strip(), "voice_id": (v.get("voice_id") or "").strip()}
+               for v in voices if (v.get("voice_id") or "").strip()]
+        return {"voices": out or [{"name": n, "voice_id": vid} for (n, vid) in DEFAULT_FAVORITE_VOICES]}
     except Exception:
-        # fallback to favorites
         return {"voices": [{"name": n, "voice_id": vid} for (n, vid) in DEFAULT_FAVORITE_VOICES]}
