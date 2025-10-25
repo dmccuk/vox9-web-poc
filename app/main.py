@@ -12,12 +12,13 @@ from sqlmodel import SQLModel, Session, create_engine, select
 
 from app.auth import single_user_guard
 from app.models import Job
-from app.pipeline_adapter import run_pipeline_adapter
+from app.pipeline_adapter import run_pipeline_adapter  # kept for future use
 from app.storage import (
     presign_upload,
     presign_download,
     list_objects,
     put_object_bytes,
+    get_object_text,
 )
 from app.settings import settings
 from app.tts import synthesize_elevenlabs
@@ -43,79 +44,113 @@ def healthz():
 # ----- CORS (POC: permissive; tighten later) -----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # later: set to your exact Render origin
+    allow_origins=["*"],  # later: restrict to your Render origin
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----- DB setup -----
+# ----- DB (kept; not used in the simplified flow yet) -----
 engine = create_engine("sqlite:///./jobs.db")
 SQLModel.metadata.create_all(engine)
 
 def save_job(job: Job):
     with Session(engine) as s:
-        s.add(job)
-        s.commit()
-        s.refresh(job)
-        return job
+        s.add(job); s.commit(); s.refresh(job); return job
 
 def update_job(job_id: str, **fields):
     with Session(engine) as s:
         job = s.exec(select(Job).where(Job.id == job_id)).one()
-        for k, v in fields.items():
-            setattr(job, k, v)
+        for k, v in fields.items(): setattr(job, k, v)
         job.updated_at = datetime.utcnow()
-        s.add(job)
-        s.commit()
-        s.refresh(job)
-        return job
+        s.add(job); s.commit(); s.refresh(job); return job
 
-# ----- S3 presign & listing endpoints -----
-@app.post("/api/presign")
-def get_presign(
-    filename: str = Query(...),
-    content_type: str = Query("application/octet-stream"),
+# ----- Helpers -----
+_slug_re = re.compile(r"[^a-z0-9]+")
+def slug(s: str) -> str:
+    s = s.strip().lower()
+    s = _slug_re.sub("-", s).strip("-")
+    return s or "untitled"
+
+# ----- Upload: presign a STORY file → projects/<story>/<filename> -----
+@app.post("/api/presign_story")
+def presign_story(
+    filename: str = Query(..., description="Local filename being uploaded"),
+    content_type: str = Query("text/plain"),
     _: None = Depends(single_user_guard),
 ):
-    # Sanitize filename to avoid policy mismatches
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename)
-    key = f"{settings.S3_INPUT_PREFIX}{safe}"
+    """
+    Returns a presigned POST so the browser can upload the story file
+    directly to S3 under: projects/<story-name>/<original-filename>
+    where story-name = slug(filename without extension).
+    """
+    base = filename.rsplit(".", 1)[0].strip() or "story"
+    project = slug(base)
+    key = f"{settings.PROJECTS_PREFIX}{project}/{filename}"
     return presign_upload(key, content_type)
 
-@app.get("/api/presign_view")
-def get_presign_view(
-    key: str = Query(..., description="S3 object key to view/stream"),
+# ----- Generate narration FROM an uploaded story file in S3 -----
+@app.post("/api/tts_from_story")
+def tts_from_story(
+    payload: Dict = Body(..., example={"s3_story_key": "projects/my-story/story.txt"}),
     _: None = Depends(single_user_guard),
 ):
-    # Stream/play in browser
-    return {"url": presign_download(key, as_attachment=False)}
+    """
+    Request: { "s3_story_key": "projects/<story>/<filename.txt>" }
+    1) Reads the text from S3
+    2) Sends to ElevenLabs
+    3) Writes MP3 to projects/<story>/assets/<story>.mp3
+    Returns: { "s3_key": "...", "download_url": "..." }
+    """
+    key = (payload or {}).get("s3_story_key") or ""
+    if not key.startswith(settings.PROJECTS_PREFIX):
+        raise HTTPException(status_code=400, detail="Invalid key")
 
+    # story name is the folder name under projects/
+    parts = key.split("/")
+    if len(parts) < 3 or parts[0] != settings.PROJECTS_PREFIX.strip("/"):
+        raise HTTPException(status_code=400, detail="Key must be under projects/<story>/")
+
+    story_slug = parts[1]                 # e.g., "my-story"
+    story_filename = parts[-1]            # original file name
+    story_base = story_filename.rsplit(".", 1)[0] or story_slug
+
+    # 1) Fetch story text
+    try:
+        text = get_object_text(key)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Unable to read story: {e}")
+
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Story file is empty")
+
+    # 2) Synthesize
+    try:
+        audio = synthesize_elevenlabs(text)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TTS failed: {e}")
+
+    # 3) Save MP3 to assets/
+    ext = "mp3" if settings.ELEVEN_OUTPUT_FORMAT.lower() == "mp3" else "wav"
+    out_name = f"{story_base}.{ext}"
+    out_key = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{out_name}"
+    content_type = "audio/mpeg" if ext == "mp3" else "audio/wav"
+    put_object_bytes(out_key, content_type, audio)
+
+    # 4) Presign download (attachment)
+    url = presign_download(out_key, as_attachment=True, download_name=out_name)
+    return {"s3_key": out_key, "download_url": url}
+
+# ----- (Optional) Keep list/presign download for future UI bits -----
 @app.get("/api/presign_download")
-def get_presign_download(
-    key: str = Query(..., description="S3 object key to download"),
-    _: None = Depends(single_user_guard),
-):
-    # Force download via Content-Disposition: attachment
+def api_presign_download(key: str = Query(...), _: None = Depends(single_user_guard)):
     name = key.split("/")[-1] or "download"
     return {"url": presign_download(key, as_attachment=True, download_name=name)}
 
-@app.post("/api/presign_download_many")
-def presign_download_many(
-    payload: Dict = Body(...),
-    _: None = Depends(single_user_guard),
-):
-    keys: List[str] = payload.get("keys", [])
-    links = []
-    for k in keys:
-        name = k.split("/")[-1] or "download"
-        links.append({"key": k, "url": presign_download(k, as_attachment=True, download_name=name)})
-    return {"links": links}
-
 @app.get("/api/list_objects")
 def api_list_objects(
-    prefix: str = Query("inputs/", description="S3 prefix to list, e.g. inputs/ or outputs/"),
-    token: Optional[str] = Query(None, description="Pagination token"),
+    prefix: str = Query("projects/"),
+    token: Optional[str] = Query(None),
     max_keys: int = Query(100, ge=1, le=1000),
     _: None = Depends(single_user_guard),
 ):
@@ -123,70 +158,4 @@ def api_list_objects(
         items, next_token = list_objects(prefix=prefix, continuation_token=token, max_keys=max_keys)
         return {"items": items, "next_token": next_token}
     except Exception as e:
-        # Return readable error so the browser shows it instead of a 500
         raise HTTPException(status_code=400, detail=str(e))
-
-# ----- Text job API (demo) -----
-@app.post("/api/jobs")
-def create_job(payload: Dict, bg: BackgroundTasks, _: None = Depends(single_user_guard)):
-    """
-    payload example:
-    { "text": "hello world", "s3_input_key": "inputs/foo.mp4" }
-    """
-    text = (payload or {}).get("text") or ""
-    job = save_job(Job(input_text=text, status="queued"))
-
-    def run():
-        try:
-            update_job(job.id, status="running")
-            out = run_pipeline_adapter(text)
-            update_job(job.id, status="completed", output_text=out)
-        except Exception as e:
-            update_job(job.id, status="failed", error=str(e))
-
-    bg.add_task(run)
-    return {"job_id": job.id, "status": "queued"}
-
-@app.get("/api/jobs/{job_id}")
-def job_status(job_id: str, _: None = Depends(single_user_guard)):
-    with Session(engine) as s:
-        job = s.get(Job, job_id)
-        if not job:
-            return {"error": "not found"}
-        return {
-            "id": job.id,
-            "status": job.status,
-            "output_text": job.output_text,
-            "error": job.error,
-        }
-
-# ----- ElevenLabs TTS → S3 outputs/ -----
-@app.post("/api/tts")
-def tts_generate(
-    payload: Dict = Body(...),
-    _: None = Depends(single_user_guard),
-):
-    """
-    Request: { "text": "Hello world", "filename": "my_audio.mp3" (optional) }
-    Returns: { "s3_key": "...", "download_url": "..." }
-    """
-    text = (payload or {}).get("text", "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Text is required")
-
-    desired_name = (payload or {}).get("filename") or ""
-    ext = "mp3" if settings.ELEVEN_OUTPUT_FORMAT.lower() == "mp3" else "wav"
-    base = desired_name.rsplit(".", 1)[0] if desired_name else f"eleven_{uuid4().hex[:8]}"
-    fname = f"{base}.{ext}"
-    key = f"{settings.S3_OUTPUT_PREFIX}{fname}"
-
-    try:
-        audio = synthesize_elevenlabs(text)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"TTS failed: {e}")
-
-    content_type = "audio/mpeg" if ext == "mp3" else "audio/wav"
-    put_object_bytes(key, content_type, audio)
-
-    url = presign_download(key, as_attachment=True, download_name=fname)
-    return {"s3_key": key, "download_url": url}
