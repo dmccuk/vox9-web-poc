@@ -1,13 +1,14 @@
 """
-Vox-9 captions toolkit (Phase 1)
+Vox-9 captions toolkit (Phase 1, wrapped lines + forced style)
 - Text cleanup & segmentation
-- Caption writers: SRT / ASS / VTT
+- Caption writers: SRT / ASS / VTT (with safe line wrapping)
 - Video render: black background + burned-in ASS subtitles over your audio
-  (uses ffmpeg + libass; good defaults; style is configurable)
 """
+
 from __future__ import annotations
 import os
 import re
+import math
 import tempfile
 import subprocess
 from typing import Dict, List, Tuple
@@ -16,7 +17,6 @@ from typing import Dict, List, Tuple
 # ------------------------- text utilities -------------------------
 
 def clean_text(raw: str) -> str:
-    """Light cleanup. (Keep yours more advanced here later.)"""
     text = raw.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -24,18 +24,12 @@ def clean_text(raw: str) -> str:
 
 
 def split_into_segments(text: str) -> List[str]:
-    """
-    Very simple segmentation: split on blank lines or sentence punctuation.
-    Replace with your robust logic later.
-    """
-    # split paragraphs first
     parts = re.split(r"\n\s*\n", text)
     segs: List[str] = []
     for p in parts:
         p = p.strip()
         if not p:
             continue
-        # split sentences in the paragraph (., ?, !)
         sents = re.split(r"(?<=[.!?])\s+", p)
         for s in sents:
             s = s.strip()
@@ -45,14 +39,10 @@ def split_into_segments(text: str) -> List[str]:
 
 
 def _estimate_durations(segs: List[str]) -> List[Tuple[str, float]]:
-    """
-    Extremely crude timing estimate. Replace with your alignment later.
-    ~170 wpm ~ 2.8 wps; scale by length.
-    """
     out: List[Tuple[str, float]] = []
     for s in segs:
         words = max(1, len(s.split()))
-        dur = max(1.2, min(7.0, words / 2.8))  # 2.8 words/sec baseline
+        dur = max(1.2, min(7.0, words / 2.8))  # ~2.8 wps baseline
         out.append((s, float(dur)))
     return out
 
@@ -75,13 +65,41 @@ def _fmt_ass_ts(sec: float) -> str:
     return f"{h:01d}:{m:02d}:{s:02d}.{cs:02d}"
 
 
+# ------------------------- wrapping helpers -------------------------
+
+def _wrap_text_for_width(text: str, width_px: int, font_px: int) -> str:
+    """
+    Hard-wrap `text` to fit within width_px using a rough per-character width.
+    Heuristic: avg glyph width ~= 0.56 * font size (good for sans fonts).
+    """
+    avg_w = max(0.45, min(0.75, 0.56)) * max(10, font_px)
+    max_cols = max(20, int(width_px / avg_w))
+
+    words = text.split()
+    lines: List[str] = []
+    cur: List[str] = []
+    cur_len = 0
+
+    for w in words:
+        if cur_len + (1 if cur else 0) + len(w) > max_cols:
+            lines.append(" ".join(cur))
+            cur = [w]
+            cur_len = len(w)
+        else:
+            if cur:
+                cur_len += 1 + len(w)
+                cur.append(w)
+            else:
+                cur = [w]
+                cur_len = len(w)
+    if cur:
+        lines.append(" ".join(cur))
+    return r"\N".join(lines)  # ASS hard line-break
+
+
 # ------------------------- caption writers -------------------------
 
 def make_captions(text: str) -> Dict[str, List[Tuple[str, float]]]:
-    """
-    Produce segments with estimated durations.
-    Returns {"segs": [(text, dur_sec), ...]}
-    """
     segs = split_into_segments(clean_text(text))
     return {"segs": _estimate_durations(segs)}
 
@@ -107,35 +125,40 @@ def write_vtt(segs: List[Tuple[str, float]]) -> str:
 def write_ass(
     segs: List[Tuple[str, float]],
     *,
-    font: str = "Inter",
+    font: str = "DejaVu Sans",       # safer default (present in container after Docker tweak)
     size: int = 64,
     bold: bool = False,
     italic: bool = False,
-    resolution: str = "1080x1920",  # "W×H"
+    resolution: str = "1080x1920",   # "W×H"
+    margin_l: int = 80,
+    margin_r: int = 80,
+    margin_v: int = 120,
 ) -> str:
     # libass style header
-    w, h = resolution.split("x")
+    w, h = [int(x) for x in resolution.split("x")]
     style = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
-        f"PlayResX: {int(w)}\n"
-        f"PlayResY: {int(h)}\n"
+        f"PlayResX: {w}\n"
+        f"PlayResY: {h}\n"
         "WrapStyle: 2\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
         f"Style: Default,{font},{int(size)},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
-        f"{-1 if bold else 0},{-1 if italic else 0},0,0,100,100,0,0,1,3,0,2,80,80,120,0\n\n"
+        f"{-1 if bold else 0},{-1 if italic else 0},0,0,100,100,0,0,1,3,0,2,{margin_l},{margin_r},{margin_v},0\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
-    # events
+    # events with safe hard-wrapping
+    usable_width = max(50, w - margin_l - margin_r)
     t = 0.0
     ev: List[str] = []
     for line, dur in segs:
-        ev.append(f"Dialogue: 0,{_fmt_ass_ts(t)},{_fmt_ass_ts(t+dur)},Default,,0,0,0,,{line}")
+        safe = _wrap_text_for_width(line, usable_width, size)
+        ev.append(f"Dialogue: 0,{_fmt_ass_ts(t)},{_fmt_ass_ts(t+dur)},Default,,0,0,0,,{safe}")
         t += dur
 
     return style + "\n".join(ev) + "\n"
@@ -155,7 +178,9 @@ def render_burned_mp4(
     *,
     audio_ext: str = "mp3",         # "mp3" or "wav" — just to choose temp suffix
     resolution: str = "1080x1920",  # "W×H"
-    layout: str = "9:16",           # informational; we compute size from resolution
+    layout: str = "9:16",
+    # force_style provides a last-resort override to libass at filter time
+    force_style: str = "Alignment=2,WrapStyle=2,MarginL=80,MarginR=80,MarginV=120",
 ) -> bytes:
     """
     Compose a simple black video of given resolution, burn ASS subtitles, mux with audio.
@@ -180,14 +205,12 @@ def render_burned_mp4(
     except Exception:
         dur = 10.0
 
-    # IMPORTANT: list BOTH inputs first, then apply -vf to the video stream.
-    # (Previous version placed -vf before the audio input, causing ffmpeg to
-    # try to apply the filter to the next input.)
+    # both inputs first; then apply video filter
     _run_ffmpeg([
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-f", "lavfi", "-i", f"color=black:s={resolution}:d={dur}",  # video input
         "-i", a_path,                                               # audio input
-        "-vf", f"subtitles='{s_path}'",                             # filter for the video
+        "-vf", f"subtitles=filename='{s_path}':force_style='{force_style}'",
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-shortest",
