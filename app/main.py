@@ -1,6 +1,6 @@
 from pathlib import Path
 import re
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 from fastapi import FastAPI, Depends, Query, Body, HTTPException
 from fastapi.responses import FileResponse
@@ -14,9 +14,15 @@ from app.storage import (
     list_tree,
     put_object_bytes,
     get_object_text,
+    delete_object,
 )
 from app.settings import settings
 from app.tts import synthesize_elevenlabs, list_voices
+from app.vox9_pipeline import (
+    make_narration,
+    make_captions_from_text,
+    make_black_mp4_with_audio,
+)
 
 app = FastAPI()
 
@@ -39,7 +45,7 @@ def healthz():
 # ----- CORS (POC) -----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later to your Render domain
+    allow_origins=["*"],  # tighten later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -71,13 +77,22 @@ def api_tree(
         data.setdefault("error", None)
         return data
     except Exception as e:
-        # Don't block the UI — return an empty listing plus an error message
         return {"folders": [], "files": [], "next_token": None, "error": str(e)}
 
 @app.get("/api/presign_download")
 def api_presign_download(key: str = Query(...), _: None = Depends(single_user_guard)):
     name = key.split("/")[-1] or "download"
     return {"url": presign_download(key, as_attachment=True, download_name=name)}
+
+@app.delete("/api/object")
+def api_delete_object(key: str = Query(...), _: None = Depends(single_user_guard)):
+    if not key.startswith(settings.PROJECTS_PREFIX):
+        raise HTTPException(status_code=403, detail="Forbidden path")
+    try:
+        delete_object(key)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 # ---------- Upload story ----------
 @app.post("/api/presign_story")
@@ -106,18 +121,12 @@ def api_voices(_: None = Depends(single_user_guard)):
     default_id = settings.ELEVEN_VOICE_ID or (voices[0]["voice_id"] if voices else None)
     return {"voices": voices, "default_voice_id": default_id}
 
-# ---------- TTS from story ----------
+# ---------- Simple TTS (kept for compatibility, optional in UI) ----------
 @app.post("/api/tts_from_story")
 def tts_from_story(
     payload: Dict = Body(..., example={"s3_story_key": "projects/my-story/story.txt", "voice_id": "<optional>"}),
     _: None = Depends(single_user_guard),
 ):
-    """
-    1) Read text from S3 key under projects/<story>/...
-    2) TTS via ElevenLabs (optional voice_id override)
-    3) Save to projects/<story>/assets/<story>.mp3 (or .wav)
-    4) Return a presigned *download* URL
-    """
     key = (payload or {}).get("s3_story_key") or ""
     if not key.startswith(settings.PROJECTS_PREFIX):
         raise HTTPException(status_code=400, detail="Invalid key")
@@ -130,28 +139,102 @@ def tts_from_story(
     story_filename = parts[-1]
     story_base = story_filename.rsplit(".", 1)[0] or story_slug
 
-    # 1) Fetch story text
-    try:
-        text = get_object_text(key)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Unable to read story: {e}")
+    text = get_object_text(key)
     if not text.strip():
         raise HTTPException(status_code=400, detail="Story file is empty")
 
-    # 2) TTS
     voice_id = (payload or {}).get("voice_id") or settings.ELEVEN_VOICE_ID
-    try:
-        audio = synthesize_elevenlabs(text, voice_id=voice_id)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"TTS failed: {e}")
+    audio = synthesize_elevenlabs(text, voice_id=voice_id)
 
-    # 3) Save to assets/
     ext = "mp3" if settings.ELEVEN_OUTPUT_FORMAT.lower() == "mp3" else "wav"
     out_name = f"{story_base}.{ext}"
     out_key = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{out_name}"
     content_type = "audio/mpeg" if ext == "mp3" else "audio/wav"
     put_object_bytes(out_key, content_type, audio)
 
-    # 4) Download link (forced attachment)
     url = presign_download(out_key, as_attachment=True, download_name=out_name)
     return {"s3_key": out_key, "download_url": url}
+
+# ---------- Multi-asset generation ----------
+@app.post("/api/generate_assets")
+def generate_assets(
+    payload: Dict = Body(..., example={
+        "s3_story_key": "projects/my-story/story.txt",
+        "voice_id": "<optional>",
+        "outputs": ["mp3","srt","wav","ass","vtt","mp4"]
+    }),
+    _: None = Depends(single_user_guard),
+):
+    """
+    Generate multiple assets from a story:
+      - audio: mp3,wav
+      - captions: srt,ass,vtt
+      - video: mp4 (black background with audio; no burn-in yet)
+    Returns: { assets: [{type,key,url}] }
+    """
+    key = (payload or {}).get("s3_story_key") or ""
+    if not key.startswith(settings.PROJECTS_PREFIX):
+        raise HTTPException(status_code=400, detail="Invalid key")
+    wanted: List[str] = [o.lower() for o in (payload or {}).get("outputs", [])] or ["mp3", "srt"]
+
+    parts = key.split("/")
+    if len(parts) < 3 or parts[0] != settings.PROJECTS_PREFIX.strip("/"):
+        raise HTTPException(status_code=400, detail="Key must be under projects/<story>/")
+
+    story_slug = parts[1]
+    story_filename = parts[-1]
+    story_base = story_filename.rsplit(".", 1)[0] or story_slug
+
+    # Read text
+    text = get_object_text(key)
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Story file is empty")
+
+    # Audio
+    need_mp3 = "mp3" in wanted
+    need_wav = "wav" in wanted
+    audio_map = {"mp3": None, "wav": None}
+    if need_mp3 or need_wav:
+        audio_map = make_narration(text, payload.get("voice_id") or settings.ELEVEN_VOICE_ID, need_mp3, need_wav)
+
+    results = []
+
+    # Upload audio
+    if audio_map.get("mp3"):
+        k = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{story_base}.mp3"
+        put_object_bytes(k, "audio/mpeg", audio_map["mp3"])
+        results.append({"type": "mp3", "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.mp3")})
+
+    if audio_map.get("wav"):
+        k = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{story_base}.wav"
+        put_object_bytes(k, "audio/wav", audio_map["wav"])
+        results.append({"type": "wav", "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.wav")})
+
+    # Captions
+    if any(x in wanted for x in ("srt","ass","vtt")):
+        caps = make_captions_from_text(text)
+        if "srt" in wanted:
+            k = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{story_base}.srt"
+            put_object_bytes(k, "text/plain; charset=utf-8", caps["srt"].encode("utf-8"))
+            results.append({"type": "srt", "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.srt")})
+        if "ass" in wanted:
+            k = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{story_base}.ass"
+            put_object_bytes(k, "text/plain; charset=utf-8", caps["ass"].encode("utf-8"))
+            results.append({"type": "ass", "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.ass")})
+        if "vtt" in wanted:
+            k = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{story_base}.vtt"
+            put_object_bytes(k, "text/vtt; charset=utf-8", caps["vtt"].encode("utf-8"))
+            results.append({"type": "vtt", "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.vtt")})
+
+    # MP4 (scaffold: black background + audio)
+    if "mp4" in wanted:
+        # Need some audio; prefer WAV if available else MP3
+        audio_bytes = audio_map.get("wav") or audio_map.get("mp3")
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="MP4 requested but no audio was generated")
+        mp4 = make_black_mp4_with_audio(audio_bytes, layout="9:16")
+        k = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{story_base}.mp4"
+        put_object_bytes(k, "video/mp4", mp4)
+        results.append({"type": "mp4", "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.mp4")})
+
+    return {"assets": results}
