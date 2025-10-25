@@ -17,12 +17,8 @@ from app.storage import (
     delete_object,
 )
 from app.settings import settings
-from app.tts import synthesize_elevenlabs, list_voices
-from app.vox9_pipeline import (
-    make_narration,
-    make_captions_from_text,
-    make_black_mp4_with_audio,
-)
+from app.tts import list_voices
+from app.asset_pipeline import generate_assets, DEFAULT_STYLE
 
 app = FastAPI()
 
@@ -107,50 +103,21 @@ def presign_story(
 def api_voices(_: None = Depends(single_user_guard)):
     return list_voices()
 
-# ---------- Simple TTS (kept for compatibility) ----------
-@app.post("/api/tts_from_story")
-def tts_from_story(
-    payload: Dict = Body(..., example={"s3_story_key": "projects/my-story/story.txt", "voice_id": "<optional>"}),
-    _: None = Depends(single_user_guard),
-):
-    key = (payload or {}).get("s3_story_key") or ""
-    if not key.startswith(settings.PROJECTS_PREFIX):
-        raise HTTPException(status_code=400, detail="Invalid key")
-
-    parts = key.split("/")
-    if len(parts) < 3 or parts[0] != settings.PROJECTS_PREFIX.strip("/"):
-        raise HTTPException(status_code=400, detail="Key must be under projects/<story>/")
-
-    story_slug = parts[1]
-    story_filename = parts[-1]
-    story_base = story_filename.rsplit(".", 1)[0] or story_slug
-
-    text = get_object_text(key)
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="Story file is empty")
-
-    voice_id = (payload or {}).get("voice_id") or settings.ELEVEN_VOICE_ID
-    try:
-        audio = synthesize_elevenlabs(text, voice_id=voice_id)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"TTS failed: {e}")
-
-    ext = "mp3" if settings.ELEVEN_OUTPUT_FORMAT.lower() == "mp3" else "wav"
-    out_name = f"{story_base}.{ext}"
-    out_key = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{out_name}"
-    content_type = "audio/mpeg" if ext == "mp3" else "audio/wav"
-    put_object_bytes(out_key, content_type, audio)
-
-    url = presign_download(out_key, as_attachment=True, download_name=out_name)
-    return {"s3_key": out_key, "download_url": url}
-
-# ---------- Multi-asset generation ----------
+# ---------- Multi-asset generation (Phase 1 style-ready) ----------
 @app.post("/api/generate_assets")
-def generate_assets(
+def api_generate_assets(
     payload: Dict = Body(..., example={
         "s3_story_key": "projects/my-story/story.txt",
         "voice_id": "<optional>",
-        "outputs": ["mp3","srt","wav","ass","vtt","mp4"]
+        "outputs": ["mp3","srt","ass","vtt","mp4"],
+        "caption_style": {
+          "font": "Inter",
+          "size": 64,
+          "bold": False,
+          "italic": False,
+          "resolution": "1080x1920",
+          "layout": "9:16"
+        }
     }),
     _: None = Depends(single_user_guard),
 ):
@@ -172,57 +139,35 @@ def generate_assets(
     if not text.strip():
         raise HTTPException(status_code=400, detail="Story file is empty")
 
-    # Audio
-    need_mp3 = "mp3" in wanted
-    need_wav = "wav" in wanted
-    audio_map = {"mp3": None, "wav": None}
-    if need_mp3 or need_wav or "mp4" in wanted:
-        try:
-            audio_map = make_narration(text, payload.get("voice_id") or settings.ELEVEN_VOICE_ID, need_mp3 or "mp4" in wanted, need_wav)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"TTS failed: {e}")
+    # Style config (backend-ready; UI will pass later)
+    style = payload.get("caption_style") or DEFAULT_STYLE
+    voice_id = payload.get("voice_id") or settings.ELEVEN_VOICE_ID
 
+    # Generate everything in-memory
+    try:
+        blobs = generate_assets(
+            story_text=text,
+            voice_id=voice_id,
+            outputs=wanted,
+            style=style,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Generation failed: {e}")
+
+    # Upload to S3 under assets/
     results = []
+    ct_map = {
+        "mp3": "audio/mpeg",
+        "wav": "audio/wav",
+        "srt": "text/plain; charset=utf-8",
+        "ass": "text/plain; charset=utf-8",
+        "vtt": "text/vtt; charset=utf-8",
+        "mp4": "video/mp4",
+    }
 
-    # Upload audio
-    if audio_map.get("mp3"):
-        k = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{story_base}.mp3"
-        put_object_bytes(k, "audio/mpeg", audio_map["mp3"])
-        results.append({"type": "mp3", "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.mp3")})
-
-    if audio_map.get("wav"):
-        k = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{story_base}.wav"
-        put_object_bytes(k, "audio/wav", audio_map["wav"])
-        results.append({"type": "wav", "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.wav")})
-
-    # Captions
-    if any(x in wanted for x in ("srt","ass","vtt")):
-        caps = make_captions_from_text(text)
-        if "srt" in wanted:
-            k = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{story_base}.srt"
-            put_object_bytes(k, "text/plain; charset=utf-8", caps["srt"].encode("utf-8"))
-            results.append({"type": "srt", "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.srt")})
-        if "ass" in wanted:
-            k = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{story_base}.ass"
-            put_object_bytes(k, "text/plain; charset=utf-8", caps["ass"].encode("utf-8"))
-            results.append({"type": "ass", "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.ass")})
-        if "vtt" in wanted:
-            k = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{story_base}.vtt"
-            put_object_bytes(k, "text/vtt; charset=utf-8", caps["vtt"].encode("utf-8"))
-            results.append({"type": "vtt", "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.vtt")})
-
-    # MP4 (black bg + audio)
-    if "mp4" in wanted:
-        audio_bytes = audio_map.get("wav") or audio_map.get("mp3")
-        if not audio_bytes:
-            raise HTTPException(status_code=400, detail="MP4 requested but no audio was generated")
-        ext = "wav" if audio_map.get("wav") else "mp3"
-        try:
-            mp4 = make_black_mp4_with_audio(audio_bytes, ext=ext, layout="9:16")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"MP4 render failed: {e}")
-        k = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{story_base}.mp4"
-        put_object_bytes(k, "video/mp4", mp4)
-        results.append({"type": "mp4", "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.mp4")})
+    for ext, data in blobs.items():
+        k = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{story_base}.{ext}"
+        put_object_bytes(k, ct_map.get(ext, "application/octet-stream"), data)
+        results.append({"type": ext, "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.{ext}")})
 
     return {"assets": results}
