@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     # ElevenLabs
     ELEVEN_API_KEY: str | None = None
     ELEVEN_VOICE_ID: str | None = None
-    ELEVEN_MODEL_ID: str = "eleven_multilingual_v2"
+    ELEVEN_MODEL_ID: str = "eleven_monolingual_v1"
     # Accepted: "mp3" or "wav"
     ELEVEN_OUTPUT_FORMAT: str = "mp3"
 
