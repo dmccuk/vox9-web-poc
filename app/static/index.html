@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Vox-9 — Narration POC</title>
+  <title>Vox-9 — Generate Narration</title>
   <link rel="icon" type="image/x-icon" href="/static/favicon.ico" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
@@ -15,7 +15,7 @@
     .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
     button { padding: .6rem 1rem; border-radius: 10px; border: 0; background: #4f46e5; color: #fff; cursor: pointer; }
     button[disabled] { opacity: .6; cursor: not-allowed; }
-    .ghost { background: transparent; border: 1px solid #444; }
+    .ghost { background: transparent; border: 1px solid #444; color: inherit; } /* ensure visible text */
     .box { border: 2px dashed #555; border-radius: 12px; padding: 1.4rem; text-align: center; }
     .box.dragover { border-color: #4f46e5; background: rgba(79,70,229,.08); }
     table { width: 100%; border-collapse: collapse; }
@@ -101,9 +101,7 @@
     const btnVoices = document.getElementById('btnVoices');
 
     let cwd = 'projects/';     // current folder prefix
-    let uploadedKey = null;    // S3 key of uploaded story
     let currentStoryKey = null;// story selected from explorer (or uploaded)
-    let voicesCache = [];
 
     // ---------- Helpers
     function setDrag(el, on) { el.classList.toggle('dragover', on); }
@@ -132,8 +130,10 @@
       const url = new URL(`${apiBase}/api/tree`);
       url.searchParams.set('prefix', prefix);
       const res = await fetch(url);
-      if (!res.ok) throw new Error('tree failed');
-      return res.json(); // {folders, files}
+      // tolerate 200 with an error field
+      const data = await res.json().catch(()=>({folders:[],files:[],error:'Bad JSON'}));
+      if (!res.ok) data.error = data.error || `HTTP ${res.status}`;
+      return data; // {folders, files, error?}
     }
 
     async function loadTree(){
@@ -141,6 +141,10 @@
       explorer.innerHTML = 'Loading…';
       try {
         const data = await tree(cwd);
+        if (data.error) {
+          explorer.innerHTML = `<div class="muted">Failed to load: ${data.error}</div>`;
+          return;
+        }
         const flds = data.folders || [];
         const files = data.files || [];
         const rows = [];
@@ -193,7 +197,7 @@
           });
         });
       } catch (e) {
-        explorer.innerHTML = '<div class="muted">Failed to load</div>';
+        explorer.innerHTML = '<div class="muted">Failed to load (unexpected)</div>';
         console.error(e);
       }
     }
@@ -260,13 +264,18 @@
     // ---------- Voices
     async function loadVoices(){
       voiceSel.innerHTML = '<option value="">Loading…</option>';
-      const res = await fetch(`${apiBase}/api/voices`);
-      const data = await res.json();
-      voicesCache = data.voices || [];
-      const def = data.default_voice_id || '';
-      const opts = voicesCache.map(v => `<option value="${v.voice_id}">${v.name}</option>`).join('');
-      voiceSel.innerHTML = opts || '<option value="">(no voices)</option>';
-      if (def) voiceSel.value = def;
+      try {
+        const res = await fetch(`${apiBase}/api/voices`);
+        const data = await res.json();
+        const voices = data.voices || [];
+        const def = data.default_voice_id || '';
+        const opts = voices.map(v => `<option value="${v.voice_id}">${v.name}</option>`).join('');
+        voiceSel.innerHTML = opts || '<option value="">(no voices)</option>';
+        if (def) voiceSel.value = def;
+      } catch (e) {
+        console.error(e);
+        voiceSel.innerHTML = '<option value="">(failed to load voices)</option>';
+      }
     }
     btnVoices.addEventListener('click', loadVoices);
 
