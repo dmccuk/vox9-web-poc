@@ -170,14 +170,16 @@
             }
             rows.push(`</tbody></table>`);
           }
+          <!-- inside loadTree(), when rendering files -->
           if (files.length){
             rows.push(`<table><thead><tr><th>Name</th><th>Action</th></tr></thead><tbody>`);
             for (const it of files){
               const n = nameFromKey(it.key);
+              const isTxt = /\.txt$/i.test(n);
               rows.push(`<tr>
                 <td>📄 ${n}</td>
                 <td>
-                  <button class="useStory" data-key="${it.key}">Use as story</button>
+                  ${isTxt ? `<button class="useStory" data-key="${it.key}">Use as story</button>` : ``}
                   <button class="dl" data-key="${it.key}">Download</button>
                   <button class="rm" data-key="${it.key}">Delete</button>
                 </td>
