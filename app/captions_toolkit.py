@@ -180,12 +180,14 @@ def render_burned_mp4(
     except Exception:
         dur = 10.0
 
-    # video synth + subtitles
+    # IMPORTANT: list BOTH inputs first, then apply -vf to the video stream.
+    # (Previous version placed -vf before the audio input, causing ffmpeg to
+    # try to apply the filter to the next input.)
     _run_ffmpeg([
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", f"color=black:s={resolution}:d={dur}",
-        "-vf", f"subtitles='{s_path}'",
-        "-i", a_path,
+        "-f", "lavfi", "-i", f"color=black:s={resolution}:d={dur}",  # video input
+        "-i", a_path,                                               # audio input
+        "-vf", f"subtitles='{s_path}'",                             # filter for the video
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-shortest",
