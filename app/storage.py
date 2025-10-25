@@ -51,7 +51,11 @@ def presign_download(
         if not download_name:
             download_name = key.split("/")[-1] or "download"
         params["ResponseContentDisposition"] = f'attachment; filename="{download_name}"'
-    return s3.generate_presigned_url("get_object", Params=params, ExpiresIn=ttl)
+    return s3.generate_presigned_url(
+        "get_object",
+        Params=params,
+        ExpiresIn=ttl
+    )
 
 def list_objects(prefix: str, continuation_token: Optional[str] = None, max_keys: int = 100) -> Tuple[List[Dict], Optional[str]]:
     kwargs = {"Bucket": settings.S3_BUCKET, "Prefix": prefix, "MaxKeys": max_keys}
@@ -110,3 +114,7 @@ def list_tree(prefix: str, continuation_token: Optional[str] = None, max_keys: i
             "last_modified": getattr(lm, "isoformat", lambda: str(lm))(),
         })
     return {"folders": folders, "files": files, "next_token": resp.get("NextContinuationToken")}
+
+def delete_object(key: str):
+    s3.delete_object(Bucket=settings.S3_BUCKET, Key=key)
+    return True
