@@ -15,20 +15,21 @@ s3 = boto3.client(
     config=cfg,
 )
 
+def put_object_bytes(key: str, content_type: str, data: bytes):
+    s3.put_object(Bucket=settings.S3_BUCKET, Key=key, Body=data, ContentType=content_type)
+    return key
+
 def presign_upload(key: str, content_type: str, max_mb: int = 200, ttl: int = 3600):
     """
     Generate a presigned POST for browser-based direct upload.
     Includes Content-Type condition to avoid 'extra input fields' error.
     """
     max_bytes = max_mb * 1024 * 1024
-    fields = {
-        "Content-Type": content_type,
-        "key": key,
-    }
+    fields = {"Content-Type": content_type, "key": key}
     conditions = [
         ["content-length-range", 0, max_bytes],
-        ["starts-with", "$key", ""],              # or f"{settings.S3_INPUT_PREFIX}"
-        ["starts-with", "$Content-Type", ""],     # allow any content type
+        ["starts-with", "$key", ""],
+        ["starts-with", "$Content-Type", ""],
     ]
     return s3.generate_presigned_post(
         Bucket=settings.S3_BUCKET,
@@ -65,11 +66,7 @@ def list_objects(prefix: str, continuation_token: Optional[str] = None, max_keys
     List S3 objects under a prefix with pagination.
     Requires IAM permission: s3:ListBucket on the bucket (optionally scoped to the prefixes).
     """
-    kwargs = {
-        "Bucket": settings.S3_BUCKET,
-        "Prefix": prefix,
-        "MaxKeys": max_keys,
-    }
+    kwargs = {"Bucket": settings.S3_BUCKET, "Prefix": prefix, "MaxKeys": max_keys}
     if continuation_token:
         kwargs["ContinuationToken"] = continuation_token
 
@@ -91,6 +88,4 @@ def list_objects(prefix: str, continuation_token: Optional[str] = None, max_keys
             "size": obj.get("Size", 0),
             "last_modified": lm.isoformat() if hasattr(lm, "isoformat") else str(lm),
         })
-
-    next_token = resp.get("NextContinuationToken")
-    return items, next_token
+    return items, resp.get("NextContinuationToken")
