@@ -6,3 +6,4 @@ pydantic-settings==2.4.0
 python-multipart==0.0.9
 boto3==1.35.0
 requests==2.32.3
+pydub==0.25.1
