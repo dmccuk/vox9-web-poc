@@ -234,9 +234,9 @@ def generate_assets_from_story(
     Synthesize per sentence, measure actual durations, create synced captions.
     Returns local file paths.
     """
-    api_key = os.getenv("ELEVENLABS_API_KEY")
+    api_key = os.getenv("ELEVEN_API_KEY")
     if not api_key:
-        raise RuntimeError("ELEVENLABS_API_KEY is missing")
+        raise RuntimeError("ELEVEN_API_KEY is missing")
     eleven = ElevenAPI(api_key)
 
     cleaned = clean_text(story_text)
@@ -386,7 +386,7 @@ def list_voices():
     """
     Return all available ElevenLabs voices, or fallback defaults if API fails.
     """
-    api_key = os.getenv("ELEVENLABS_API_KEY")
+    api_key = os.getenv("ELEVEN_API_KEY")
     hdrs = {"xi-api-key": api_key} if api_key else {}
     try:
         if not api_key:
