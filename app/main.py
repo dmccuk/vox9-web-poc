@@ -51,14 +51,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----- Helpers -----
+# ----- helpers -----
 _slug_re = re.compile(r"[^a-z0-9]+")
 def slug(s: str) -> str:
     s = s.strip().lower()
     s = _slug_re.sub("-", s).strip("-")
     return s or "untitled"
 
-# ---------- S3 Explorer APIs ----------
+# ---------- S3 Explorer ----------
 @app.get("/api/tree")
 def api_tree(
     prefix: str = Query("projects/", description="Folder prefix (e.g. 'projects/' or 'projects/my-story/')"),
@@ -66,10 +66,6 @@ def api_tree(
     max_keys: int = Query(200, ge=1, le=1000),
     _: None = Depends(single_user_guard),
 ):
-    """
-    Tolerant folder-style listing. Always returns 200 with:
-    { folders: [...], files: [...], next_token: "...", error: "..." (optional) }
-    """
     try:
         if not prefix.endswith("/"):
             prefix = prefix + "/"
@@ -101,27 +97,17 @@ def presign_story(
     content_type: str = Query("text/plain"),
     _: None = Depends(single_user_guard),
 ):
-    """
-    Put story file under: projects/<story-slug>/<original-filename>
-    """
     base = filename.rsplit(".", 1)[0].strip() or "story"
     project = slug(base)
     key = f"{settings.PROJECTS_PREFIX}{project}/{filename}"
     return presign_upload(key, content_type)
 
-# ---------- ElevenLabs voices ----------
+# ---------- Voices ----------
 @app.get("/api/voices")
 def api_voices(_: None = Depends(single_user_guard)):
-    """
-    Returns: { voices: [{voice_id, name}], default_voice_id: '...' }
-    Default = ELEVEN_VOICE_ID if set, otherwise first voice from merged list.
-    """
-    data = list_voices()
-    voices = data.get("voices", [])
-    default_id = settings.ELEVEN_VOICE_ID or (voices[0]["voice_id"] if voices else None)
-    return {"voices": voices, "default_voice_id": default_id}
+    return list_voices()
 
-# ---------- Simple TTS (kept for compatibility, optional in UI) ----------
+# ---------- Simple TTS (kept for compatibility) ----------
 @app.post("/api/tts_from_story")
 def tts_from_story(
     payload: Dict = Body(..., example={"s3_story_key": "projects/my-story/story.txt", "voice_id": "<optional>"}),
@@ -144,7 +130,10 @@ def tts_from_story(
         raise HTTPException(status_code=400, detail="Story file is empty")
 
     voice_id = (payload or {}).get("voice_id") or settings.ELEVEN_VOICE_ID
-    audio = synthesize_elevenlabs(text, voice_id=voice_id)
+    try:
+        audio = synthesize_elevenlabs(text, voice_id=voice_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TTS failed: {e}")
 
     ext = "mp3" if settings.ELEVEN_OUTPUT_FORMAT.lower() == "mp3" else "wav"
     out_name = f"{story_base}.{ext}"
@@ -165,13 +154,6 @@ def generate_assets(
     }),
     _: None = Depends(single_user_guard),
 ):
-    """
-    Generate multiple assets from a story:
-      - audio: mp3,wav
-      - captions: srt,ass,vtt
-      - video: mp4 (black background with audio; no burn-in yet)
-    Returns: { assets: [{type,key,url}] }
-    """
     key = (payload or {}).get("s3_story_key") or ""
     if not key.startswith(settings.PROJECTS_PREFIX):
         raise HTTPException(status_code=400, detail="Invalid key")
@@ -185,7 +167,7 @@ def generate_assets(
     story_filename = parts[-1]
     story_base = story_filename.rsplit(".", 1)[0] or story_slug
 
-    # Read text
+    # Read story
     text = get_object_text(key)
     if not text.strip():
         raise HTTPException(status_code=400, detail="Story file is empty")
@@ -194,8 +176,11 @@ def generate_assets(
     need_mp3 = "mp3" in wanted
     need_wav = "wav" in wanted
     audio_map = {"mp3": None, "wav": None}
-    if need_mp3 or need_wav:
-        audio_map = make_narration(text, payload.get("voice_id") or settings.ELEVEN_VOICE_ID, need_mp3, need_wav)
+    if need_mp3 or need_wav or "mp4" in wanted:
+        try:
+            audio_map = make_narration(text, payload.get("voice_id") or settings.ELEVEN_VOICE_ID, need_mp3 or "mp4" in wanted, need_wav)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"TTS failed: {e}")
 
     results = []
 
@@ -226,13 +211,16 @@ def generate_assets(
             put_object_bytes(k, "text/vtt; charset=utf-8", caps["vtt"].encode("utf-8"))
             results.append({"type": "vtt", "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.vtt")})
 
-    # MP4 (scaffold: black background + audio)
+    # MP4 (black bg + audio)
     if "mp4" in wanted:
-        # Need some audio; prefer WAV if available else MP3
         audio_bytes = audio_map.get("wav") or audio_map.get("mp3")
         if not audio_bytes:
             raise HTTPException(status_code=400, detail="MP4 requested but no audio was generated")
-        mp4 = make_black_mp4_with_audio(audio_bytes, layout="9:16")
+        ext = "wav" if audio_map.get("wav") else "mp3"
+        try:
+            mp4 = make_black_mp4_with_audio(audio_bytes, ext=ext, layout="9:16")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"MP4 render failed: {e}")
         k = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{story_base}.mp4"
         put_object_bytes(k, "video/mp4", mp4)
         results.append({"type": "mp4", "key": k, "url": presign_download(k, as_attachment=True, download_name=f"{story_base}.mp4")})
