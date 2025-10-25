@@ -1,7 +1,6 @@
 from pathlib import Path
 import re
-from uuid import uuid4
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from fastapi import FastAPI, Depends, Query, Body, HTTPException
 from fastapi.responses import FileResponse
@@ -12,7 +11,6 @@ from app.auth import single_user_guard
 from app.storage import (
     presign_upload,
     presign_download,
-    list_objects,
     list_tree,
     put_object_bytes,
     get_object_text,
@@ -41,7 +39,7 @@ def healthz():
 # ----- CORS (POC) -----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # tighten later to your Render domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -81,6 +79,9 @@ def presign_story(
     content_type: str = Query("text/plain"),
     _: None = Depends(single_user_guard),
 ):
+    """
+    Put story file under: projects/<story-slug>/<original-filename>
+    """
     base = filename.rsplit(".", 1)[0].strip() or "story"
     project = slug(base)
     key = f"{settings.PROJECTS_PREFIX}{project}/{filename}"
@@ -91,14 +92,12 @@ def presign_story(
 def api_voices(_: None = Depends(single_user_guard)):
     """
     Returns: { voices: [{voice_id, name}], default_voice_id: '...' }
+    Default = ELEVEN_VOICE_ID if set, otherwise first voice from merged list.
     """
-    try:
-        data = list_voices()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Voice import failed: {e}")
-    voices_raw = data.get("voices", []) or []
-    voices = [{"voice_id": v.get("voice_id"), "name": v.get("name")} for v in voices_raw if v.get("voice_id")]
-    return {"voices": voices, "default_voice_id": settings.ELEVEN_VOICE_ID}
+    data = list_voices()
+    voices = data.get("voices", [])
+    default_id = settings.ELEVEN_VOICE_ID or (voices[0]["voice_id"] if voices else None)
+    return {"voices": voices, "default_voice_id": default_id}
 
 # ---------- TTS from story ----------
 @app.post("/api/tts_from_story")
@@ -106,6 +105,12 @@ def tts_from_story(
     payload: Dict = Body(..., example={"s3_story_key": "projects/my-story/story.txt", "voice_id": "<optional>"}),
     _: None = Depends(single_user_guard),
 ):
+    """
+    1) Read text from S3 key under projects/<story>/...
+    2) TTS via ElevenLabs (optional voice_id override)
+    3) Save to projects/<story>/assets/<story>.mp3 (or .wav)
+    4) Return a presigned *download* URL
+    """
     key = (payload or {}).get("s3_story_key") or ""
     if not key.startswith(settings.PROJECTS_PREFIX):
         raise HTTPException(status_code=400, detail="Invalid key")
@@ -118,6 +123,7 @@ def tts_from_story(
     story_filename = parts[-1]
     story_base = story_filename.rsplit(".", 1)[0] or story_slug
 
+    # 1) Fetch story text
     try:
         text = get_object_text(key)
     except Exception as e:
@@ -125,17 +131,20 @@ def tts_from_story(
     if not text.strip():
         raise HTTPException(status_code=400, detail="Story file is empty")
 
+    # 2) TTS
     voice_id = (payload or {}).get("voice_id") or settings.ELEVEN_VOICE_ID
     try:
         audio = synthesize_elevenlabs(text, voice_id=voice_id)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"TTS failed: {e}")
 
+    # 3) Save to assets/
     ext = "mp3" if settings.ELEVEN_OUTPUT_FORMAT.lower() == "mp3" else "wav"
     out_name = f"{story_base}.{ext}"
     out_key = f"{settings.PROJECTS_PREFIX}{story_slug}/assets/{out_name}"
     content_type = "audio/mpeg" if ext == "mp3" else "audio/wav"
     put_object_bytes(out_key, content_type, audio)
 
+    # 4) Download link (forced attachment)
     url = presign_download(out_key, as_attachment=True, download_name=out_name)
     return {"s3_key": out_key, "download_url": url}
